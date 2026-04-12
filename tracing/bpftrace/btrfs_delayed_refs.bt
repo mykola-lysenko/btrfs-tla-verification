@@ -1,0 +1,77 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_delayed_refs.bt
+ *
+ * Traces Btrfs delayed reference processing events relevant to the
+ * BtrfsDelayedRefsRace.tla model (multi-aborter double-free of an extent).
+ *
+ * TLA+ model variables mapped:
+ *   ref_state      <- derived from delayed ref head state
+ *   ref_lock       <- derived from mutex lock/unlock on delayed ref head
+ *   thread_pc[T]   <- derived from function entry/exit
+ *
+ * Kernel functions traced (fs/btrfs/delayed-ref.c, Linux 6.x):
+ *   btrfs_add_delayed_ref          - add a new delayed ref
+ *   btrfs_run_delayed_refs         - run/process delayed refs
+ *   btrfs_free_delayed_refs        - free delayed ref head (abort path)
+ *   __btrfs_run_delayed_refs       - internal processing loop
+ *   run_one_delayed_ref            - process a single ref
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_delayed_refs trace started.\n");
+}
+
+kprobe:btrfs_add_delayed_ref {
+    /*
+     * arg0 = trans handle, arg1 = generic_ref *, arg2 = extent_op *
+     * We capture the bytenr from the generic_ref struct.
+     * struct btrfs_ref: bytenr is at offset 0x10 (kernel 6.x)
+     */
+    $ref = (struct btrfs_ref *)arg1;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddDelayedRef\",\"bytenr\":%llu,\"type\":%d}\n",
+        nsecs, tid, comm, $ref->bytenr, (int32)$ref->type);
+}
+
+kprobe:run_one_delayed_ref {
+    /*
+     * arg0 = trans, arg1 = node (btrfs_delayed_ref_node *)
+     * struct btrfs_delayed_ref_node: bytenr at offset 0x0
+     */
+    $node = (struct btrfs_delayed_ref_node *)arg1;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunOneDelayedRef\",\"bytenr\":%llu,\"action_type\":%d}\n",
+        nsecs, tid, comm, $node->bytenr, (int32)$node->action);
+}
+
+kretprobe:run_one_delayed_ref {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunOneDelayedRef_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_run_delayed_refs {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunDelayedRefs_Enter\",\"count\":%d}\n",
+        nsecs, tid, comm, (int32)arg1);
+    @run_start[tid] = nsecs;
+}
+
+kretprobe:btrfs_run_delayed_refs {
+    $start = @run_start[tid];
+    if ($start > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunDelayedRefs_Done\",\"duration_us\":%llu,\"ret\":%d}\n",
+            nsecs, tid, comm, (nsecs - $start) / 1000, (int32)retval);
+        delete(@run_start[tid]);
+    }
+}
+
+/* Abort path: transaction abort triggers delayed ref cleanup */
+kprobe:btrfs_abort_transaction {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AbortTransaction\",\"errno\":%d}\n",
+        nsecs, tid, comm, (int32)arg2);
+}
+
+END {
+    clear(@run_start);
+    printf("# btrfs_delayed_refs trace ended.\n");
+}

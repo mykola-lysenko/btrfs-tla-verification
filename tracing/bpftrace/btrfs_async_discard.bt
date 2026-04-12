@@ -1,0 +1,70 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_async_discard.bt
+ *
+ * Traces Btrfs async discard events relevant to the BtrfsAsyncDiscard.tla
+ * model (discard of an extent that was re-allocated before discard completes).
+ *
+ * TLA+ model variables mapped:
+ *   discard_state    <- "Pending" / "InProgress" / "Done"
+ *   extent_state     <- "Free" / "Discarding" / "Allocated"
+ *
+ * Safety invariant checked: NoDiscardAfterRealloc
+ *   -> An extent must not be discarded after it has been re-allocated.
+ *
+ * Kernel functions traced (fs/btrfs/discard.c, Linux 6.x):
+ *   btrfs_discard_queue_work       - queue an extent for async discard
+ *   btrfs_discard_cancel_work      - cancel a pending discard
+ *   btrfs_discard_extent           - issue the actual discard I/O
+ *   btrfs_alloc_reserved_extent    - allocate an extent (re-alloc path)
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_async_discard trace started.\n");
+    printf("# Invariant: NoDiscardAfterRealloc\n");
+}
+
+kprobe:btrfs_discard_queue_work {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DiscardQueue\",\"bytenr\":%llu,\"size\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1, (uint64)arg2);
+    @pending_discard[arg1] = 1;
+}
+
+kprobe:btrfs_discard_cancel_work {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DiscardCancel\",\"bytenr\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1);
+    delete(@pending_discard[arg1]);
+}
+
+kprobe:btrfs_discard_extent {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DiscardExtent_Enter\",\"bytenr\":%llu,\"size\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1, (uint64)arg2);
+    /* Check if this extent was re-allocated while pending */
+    if (@reallocated[arg1] == 1) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_DiscardAfterRealloc\",\"bytenr\":%llu}\n",
+            nsecs, tid, comm, (uint64)arg1);
+    }
+}
+kretprobe:btrfs_discard_extent {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DiscardExtent_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_alloc_reserved_extent {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AllocReservedExtent\",\"bytenr\":%llu,\"size\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1, (uint64)arg2);
+    /* Mark as reallocated if there was a pending discard */
+    if (@pending_discard[arg1] == 1) {
+        @reallocated[arg1] = 1;
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReallocWhileDiscardPending\",\"bytenr\":%llu}\n",
+            nsecs, tid, comm, (uint64)arg1);
+    }
+}
+
+END {
+    clear(@pending_discard);
+    clear(@reallocated);
+    printf("# btrfs_async_discard trace ended.\n");
+}

@@ -1,0 +1,96 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_free_space_cache.bt
+ *
+ * Traces Btrfs free space cache events relevant to the
+ * BtrfsFreeSpaceCache.tla model (double-add race condition).
+ *
+ * TLA+ model variables mapped:
+ *   space_cache_count  <- derived from add/remove operations
+ *   bg_caching_done    <- derived from block group caching state
+ *   tx_a_pc / tx_b_pc  <- derived from unpin/cache function calls
+ *
+ * Safety invariant checked: NoDoubleAdd
+ *   -> No extent range appears twice in the free space cache.
+ *
+ * Kernel functions traced (fs/btrfs/free-space-cache.c, Linux 6.x):
+ *   btrfs_add_free_space           - add extent to free space cache
+ *   btrfs_remove_free_space        - remove extent from free space cache
+ *   btrfs_cache_block_group        - trigger async block group caching
+ *   btrfs_wait_block_group_cache_done - wait for caching to complete
+ *   unpin_extent_range             - unpin extents into free space cache
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_free_space_cache trace started.\n");
+    printf("# Invariant: NoDoubleAdd — no extent added twice to cache\n");
+}
+
+kprobe:btrfs_add_free_space {
+    /*
+     * arg0 = block_group, arg1 = bytenr (offset), arg2 = size
+     */
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddFreeSpace\",\"bytenr\":%llu,\"size\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1, (uint64)arg2);
+    /* Track adds per bytenr to detect doubles */
+    @add_count[arg1] = @add_count[arg1] + 1;
+    if (@add_count[arg1] > 1) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_DoubleAdd\",\"bytenr\":%llu,\"count\":%d}\n",
+            nsecs, tid, comm, (uint64)arg1, @add_count[arg1]);
+    }
+}
+
+kretprobe:btrfs_add_free_space {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddFreeSpace_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_remove_free_space {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RemoveFreeSpace\",\"bytenr\":%llu,\"size\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1, (uint64)arg2);
+    /* Decrement tracking count on removal */
+    if (@add_count[arg1] > 0) {
+        @add_count[arg1] = @add_count[arg1] - 1;
+    }
+}
+
+kprobe:btrfs_cache_block_group {
+    /*
+     * arg0 = block_group, arg1 = load_cache_only
+     */
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CacheBlockGroup_Start\",\"load_only\":%d}\n",
+        nsecs, tid, comm, (int32)arg1);
+}
+
+kretprobe:btrfs_cache_block_group {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CacheBlockGroup_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_wait_block_group_cache_done {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitCacheDone_Enter\"}\n",
+        nsecs, tid, comm);
+    @wait_start[tid] = nsecs;
+}
+
+kretprobe:btrfs_wait_block_group_cache_done {
+    $start = @wait_start[tid];
+    if ($start > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitCacheDone_Done\",\"wait_us\":%llu}\n",
+            nsecs, tid, comm, (nsecs - $start) / 1000);
+        delete(@wait_start[tid]);
+    }
+}
+
+kprobe:unpin_extent_range {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"UnpinExtentRange\",\"start\":%llu,\"end\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1, (uint64)arg2);
+}
+
+END {
+    clear(@add_count);
+    clear(@wait_start);
+    printf("# btrfs_free_space_cache trace ended.\n");
+}

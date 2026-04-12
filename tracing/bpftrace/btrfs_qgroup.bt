@@ -1,0 +1,104 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_qgroup.bt
+ *
+ * Traces Btrfs qgroup events relevant to the BtrfsQgroup.tla model
+ * and CVE-2025-39759 (UAF: quota disable frees qgroup records while
+ * rescan iterates them without holding qgroup_lock).
+ *
+ * TLA+ model variables mapped:
+ *   qgroup_lock         <- derived from spin_lock/unlock on qgroup_lock
+ *   quotas_enabled      <- derived from btrfs_quota_enable/disable
+ *   rescan_running      <- derived from qgroup_rescan_running flag
+ *   qgroup_tree_valid   <- "Valid" / "Freed"
+ *
+ * Safety invariant checked: NoUAF
+ *   -> btrfs_free_qgroup_config must not run concurrently with
+ *      qgroup_rescan_zero_tracking without holding qgroup_lock.
+ *
+ * Kernel functions traced (fs/btrfs/qgroup.c, Linux 6.x):
+ *   btrfs_quota_enable             - enable quotas
+ *   btrfs_quota_disable            - disable quotas
+ *   btrfs_qgroup_rescan            - start rescan
+ *   btrfs_free_qgroup_config       - free all qgroup records
+ *   qgroup_rescan_zero_tracking    - rescan iteration (internal)
+ *   btrfs_qgroup_wait_for_completion - wait for rescan to finish
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_qgroup trace started (CVE-2025-39759).\n");
+    printf("# Invariant: NoUAF — qgroup_tree not freed while rescan iterates\n");
+}
+
+kprobe:btrfs_quota_enable {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaEnable_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:btrfs_quota_enable {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaEnable_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_quota_disable {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaDisable_Enter\"}\n",
+        nsecs, tid, comm);
+    @disabling[tid] = 1;
+}
+kretprobe:btrfs_quota_disable {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaDisable_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+    delete(@disabling[tid]);
+}
+
+kprobe:btrfs_qgroup_rescan {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupRescan_Enter\"}\n",
+        nsecs, tid, comm);
+    @rescan_active[tid] = 1;
+    @rescan_count = @rescan_count + 1;
+}
+kretprobe:btrfs_qgroup_rescan {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupRescan_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+    delete(@rescan_active[tid]);
+}
+
+kprobe:btrfs_free_qgroup_config {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FreeQgroupConfig_Enter\"}\n",
+        nsecs, tid, comm);
+    /* CVE-2025-39759: if rescan is running and we're freeing without lock -> UAF */
+    if (@rescan_count > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_UAF\",\"rescan_count\":%d}\n",
+            nsecs, tid, comm, @rescan_count);
+    }
+}
+kretprobe:btrfs_free_qgroup_config {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FreeQgroupConfig_Done\"}\n",
+        nsecs, tid, comm);
+}
+
+kprobe:qgroup_rescan_zero_tracking {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanZeroTracking_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:qgroup_rescan_zero_tracking {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanZeroTracking_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+    if (@rescan_count > 0) { @rescan_count = @rescan_count - 1; }
+}
+
+kprobe:btrfs_qgroup_wait_for_completion {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitRescanCompletion_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:btrfs_qgroup_wait_for_completion {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitRescanCompletion_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+END {
+    clear(@disabling);
+    clear(@rescan_active);
+    printf("# btrfs_qgroup trace ended.\n");
+}

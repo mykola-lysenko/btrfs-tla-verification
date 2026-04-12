@@ -1,0 +1,78 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_scrub.bt
+ *
+ * Traces Btrfs scrub events relevant to the BtrfsScrub.tla model
+ * (missed repair: scrub reads stale data after a concurrent write).
+ *
+ * TLA+ model variables mapped:
+ *   scrub_state      <- "Idle" / "Running" / "Done"
+ *   block_state[b]   <- "Clean" / "Dirty" / "Repaired"
+ *   scrub_pc         <- derived from scrub function entry/exit
+ *   writer_pc        <- derived from write function entry/exit
+ *
+ * Safety invariant checked: NoMissedRepair
+ *   -> If scrub reads a block and finds corruption, it must repair it.
+ *      A concurrent write must not cause scrub to skip the repair.
+ *
+ * Kernel functions traced (fs/btrfs/scrub.c, Linux 6.x):
+ *   btrfs_scrub_dev              - start scrub on a device
+ *   scrub_stripe                 - scrub a single stripe
+ *   scrub_repair_page_from_good_copy - repair a bad page
+ *   scrub_checksum               - verify checksum during scrub
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_scrub trace started.\n");
+    printf("# Invariant: NoMissedRepair — scrub repairs all detected corruption\n");
+}
+
+kprobe:btrfs_scrub_dev {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ScrubDev_Start\"}\n",
+        nsecs, tid, comm);
+    @scrub_running = 1;
+}
+kretprobe:btrfs_scrub_dev {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ScrubDev_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+    @scrub_running = 0;
+}
+
+kprobe:scrub_stripe {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ScrubStripe_Enter\",\"logical\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg2);
+}
+kretprobe:scrub_stripe {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ScrubStripe_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:scrub_repair_page_from_good_copy {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ScrubRepair\",\"logical\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg2);
+    @repairs[tid] = @repairs[tid] + 1;
+}
+
+kprobe:scrub_checksum {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ScrubChecksum\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:scrub_checksum {
+    $ret = (int32)retval;
+    if ($ret != 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ScrubChecksumFail\",\"error\":%d}\n",
+            nsecs, tid, comm, $ret);
+        @checksum_errors[tid] = @checksum_errors[tid] + 1;
+    }
+}
+
+END {
+    printf("# Scrub summary:\n");
+    print(@repairs);
+    print(@checksum_errors);
+    clear(@repairs);
+    clear(@checksum_errors);
+    printf("# btrfs_scrub trace ended.\n");
+}

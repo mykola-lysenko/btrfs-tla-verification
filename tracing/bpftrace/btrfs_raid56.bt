@@ -1,0 +1,78 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_raid56.bt
+ *
+ * Traces Btrfs RAID56 stripe write events relevant to the BtrfsRAID56.tla
+ * model (write hole: partial stripe write + crash = data/parity mismatch).
+ *
+ * TLA+ model variables mapped:
+ *   stripe_state[s]   <- "Clean" / "PartialWrite" / "Committed"
+ *   parity_valid[s]   <- TRUE / FALSE
+ *   crash_occurred    <- injected via fault injection
+ *
+ * Safety invariant checked: NoWriteHole
+ *   -> After a crash, parity must be consistent with data stripes.
+ *      (Partial write without journal = write hole.)
+ *
+ * Kernel functions traced (fs/btrfs/raid56.c, Linux 6.x):
+ *   raid56_parity_write            - write a full RAID5/6 stripe
+ *   raid56_parity_recover           - recover from a failed stripe
+ *   finish_rmw                     - complete read-modify-write cycle
+ *   raid_write_end_io              - I/O completion for stripe write
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_raid56 trace started.\n");
+    printf("# Invariant: NoWriteHole — parity consistent after partial write\n");
+}
+
+kprobe:raid56_parity_write {
+    /*
+     * arg0 = rbio (btrfs_raid_bio *)
+     * struct btrfs_raid_bio: logical at offset 0x0, stripe_len at 0x8
+     */
+    $rbio = arg0;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ParityWrite_Enter\",\"rbio\":\"0x%llx\"}\n",
+        nsecs, tid, comm, (uint64)$rbio);
+    @stripe_write_start[$rbio] = nsecs;
+}
+
+kretprobe:raid56_parity_write {
+    $rbio = (uint64)arg0;
+    $start = @stripe_write_start[$rbio];
+    if ($start > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ParityWrite_Submitted\",\"dur_us\":%llu}\n",
+            nsecs, tid, comm, (nsecs - $start) / 1000);
+        delete(@stripe_write_start[$rbio]);
+    }
+}
+
+kprobe:raid56_parity_recover {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ParityRecover_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:raid56_parity_recover {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ParityRecover_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:finish_rmw {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FinishRMW_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:finish_rmw {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FinishRMW_Done\"}\n",
+        nsecs, tid, comm);
+}
+
+kprobe:raid_write_end_io {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WriteEndIO\",\"error\":%d}\n",
+        nsecs, tid, comm, (int32)arg1);
+}
+
+END {
+    clear(@stripe_write_start);
+    printf("# btrfs_raid56 trace ended.\n");
+}

@@ -1,0 +1,74 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_autodefrag.bt
+ *
+ * Traces Btrfs autodefrag events relevant to the BtrfsAutodefrag.tla model
+ * (stale inode: defrag operates on an inode that was deleted or replaced).
+ *
+ * TLA+ model variables mapped:
+ *   inode_state      <- "Valid" / "Deleting" / "Deleted"
+ *   defrag_state     <- "Idle" / "InProgress" / "Done"
+ *   defrag_inode     <- inode number being defragged
+ *
+ * Safety invariant checked: NoStaleDefrag
+ *   -> Autodefrag must not operate on a deleted inode.
+ *
+ * Kernel functions traced (fs/btrfs/file.c, fs/btrfs/inode.c, Linux 6.x):
+ *   btrfs_defrag_file              - defragment a file
+ *   btrfs_auto_defrag_inode        - autodefrag entry point
+ *   btrfs_evict_inode              - inode eviction (delete path)
+ *   btrfs_iget                     - get inode reference
+ *   iput                           - release inode reference
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_autodefrag trace started.\n");
+    printf("# Invariant: NoStaleDefrag — defrag does not operate on deleted inode\n");
+}
+
+kprobe:btrfs_defrag_file {
+    /*
+     * arg0 = inode, arg1 = file, arg2 = range, arg3 = newer_than,
+     * arg4 = max_to_defrag
+     */
+    $inode = (struct inode *)arg0;
+    $ino   = $inode->i_ino;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DefragFile_Enter\",\"ino\":%llu}\n",
+        nsecs, tid, comm, $ino);
+    @defrag_active[$ino] = 1;
+    /* Check if inode is already evicted */
+    if (@evicted[$ino] == 1) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_StaleDefrag\",\"ino\":%llu}\n",
+            nsecs, tid, comm, $ino);
+    }
+}
+kretprobe:btrfs_defrag_file {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DefragFile_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_evict_inode {
+    $inode = (struct inode *)arg0;
+    $ino   = $inode->i_ino;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"EvictInode\",\"ino\":%llu}\n",
+        nsecs, tid, comm, $ino);
+    @evicted[$ino] = 1;
+    /* Check if defrag is currently active on this inode */
+    if (@defrag_active[$ino] == 1) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_EvictDuringDefrag\",\"ino\":%llu}\n",
+            nsecs, tid, comm, $ino);
+    }
+}
+
+kprobe:btrfs_iget {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"InodeGet\",\"ino\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1);
+}
+
+END {
+    clear(@defrag_active);
+    clear(@evicted);
+    printf("# btrfs_autodefrag trace ended.\n");
+}

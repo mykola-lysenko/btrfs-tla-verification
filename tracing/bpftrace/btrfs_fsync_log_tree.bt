@@ -1,0 +1,119 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_fsync_log_tree.bt
+ *
+ * Traces Btrfs fsync log tree events relevant to the BtrfsFsyncLogTree.tla
+ * model (CVE-2024-37354: duplicate key crash from racing fsync and
+ * size-extending write into prealloc region).
+ *
+ * TLA+ model variables mapped:
+ *   inode_size       <- i_size at time of fsync
+ *   log_tree_entries <- set of (offset, length) pairs in log tree
+ *   fsync_pc         <- derived from btrfs_sync_file entry/exit
+ *   writer_pc        <- derived from btrfs_file_write_iter entry/exit
+ *
+ * Safety invariant checked: NoLogTreeDuplicate
+ *   -> No two entries in the log tree cover the same file offset range.
+ *
+ * Kernel functions traced (fs/btrfs/file.c, fs/btrfs/tree-log.c, Linux 6.x):
+ *   btrfs_sync_file              - fsync entry point
+ *   btrfs_log_inode              - log inode to log tree
+ *   log_one_extent               - log a single extent to log tree
+ *   btrfs_drop_extents           - drop extents from log tree (split path)
+ *   btrfs_file_write_iter        - write entry point
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_fsync_log_tree trace started (CVE-2024-37354).\n");
+    printf("# Invariant: NoLogTreeDuplicate — no overlapping extents in log tree\n");
+}
+
+kprobe:btrfs_sync_file {
+    /*
+     * arg0 = file, arg1 = start, arg2 = end, arg3 = datasync
+     */
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FsyncFile_Enter\",\"datasync\":%d}\n",
+        nsecs, tid, comm, (int32)arg3);
+    @fsync_active[tid] = 1;
+    @fsync_start[tid]  = nsecs;
+}
+kretprobe:btrfs_sync_file {
+    $start = @fsync_start[tid];
+    if ($start > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FsyncFile_Done\",\"ret\":%d,\"dur_us\":%llu}\n",
+            nsecs, tid, comm, (int32)retval, (nsecs - $start) / 1000);
+        delete(@fsync_active[tid]);
+        delete(@fsync_start[tid]);
+    }
+}
+
+kprobe:btrfs_log_inode {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"LogInode_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:btrfs_log_inode {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"LogInode_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:log_one_extent {
+    /*
+     * arg0 = trans, arg1 = inode, arg2 = path, arg3 = em (extent_map)
+     * struct extent_map: start at 0x0, len at 0x8
+     */
+    $em    = (struct extent_map *)arg3;
+    $start = $em->start;
+    $len   = $em->len;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"LogOneExtent\",\"file_offset\":%llu,\"len\":%llu}\n",
+        nsecs, tid, comm, $start, $len);
+    /* Track logged extents per inode to detect overlaps */
+    @log_extents[tid, $start] = $len;
+}
+kretprobe:log_one_extent {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"LogOneExtent_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_drop_extents {
+    /*
+     * arg0 = trans, arg1 = root, arg2 = inode, arg3 = args
+     * struct btrfs_drop_extents_args: start at 0x0, end at 0x8
+     */
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DropExtents_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:btrfs_drop_extents {
+    $ret = (int32)retval;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DropExtents_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, $ret);
+    /* A non-zero return here often indicates the duplicate key BUG() */
+    if ($ret != 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_LogTreeDuplicate\",\"errno\":%d}\n",
+            nsecs, tid, comm, $ret);
+    }
+}
+
+/* Track concurrent writes during fsync */
+kprobe:btrfs_file_write_iter {
+    if (@fsync_active[tid] > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WriteDuringFsync\"}\n",
+            nsecs, tid, comm);
+    }
+}
+
+/* Detect concurrent write from a different thread while fsync is active */
+kprobe:btrfs_file_write_iter / @fsync_active[tid] == 0 / {
+    $any_fsync = 0;
+    /* Check if any thread has fsync active — bpftrace limitation: iterate map */
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"Write_Enter\"}\n",
+        nsecs, tid, comm);
+}
+
+END {
+    clear(@fsync_active);
+    clear(@fsync_start);
+    clear(@log_extents);
+    printf("# btrfs_fsync_log_tree trace ended.\n");
+}

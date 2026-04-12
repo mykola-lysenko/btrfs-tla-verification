@@ -1,0 +1,62 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_send_receive.bt
+ *
+ * Traces Btrfs send/receive path events relevant to the
+ * BtrfsSendReceive.tla model (UAF: snapshot deleted while send traverses it).
+ *
+ * TLA+ model variables mapped:
+ *   snapshot_state      <- "Valid" / "Deleting" / "Deleted"
+ *   send_in_progress    <- counter of active send operations
+ *   send_pc             <- derived from btrfs_ioctl_send entry/exit
+ *   deleter_pc          <- derived from btrfs_delete_subvolume entry/exit
+ *
+ * Safety invariant checked: NoUAF
+ *   -> send_in_progress must be > 0 while send is traversing the snapshot.
+ *      Deletion must not proceed while send_in_progress > 0.
+ *
+ * Kernel functions traced (fs/btrfs/send.c, fs/btrfs/ioctl.c, Linux 6.x):
+ *   btrfs_ioctl_send              - send ioctl entry point
+ *   btrfs_delete_subvolume        - subvolume/snapshot deletion
+ *   send_subvol                   - internal send traversal
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_send_receive trace started.\n");
+    printf("# Invariant: NoUAF — snapshot not deleted while send is active\n");
+}
+
+kprobe:btrfs_ioctl_send {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"SendStart\"}\n",
+        nsecs, tid, comm);
+    @send_active[tid] = 1;
+    @send_count = @send_count + 1;
+}
+
+kretprobe:btrfs_ioctl_send {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"SendDone\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+    delete(@send_active[tid]);
+    if (@send_count > 0) { @send_count = @send_count - 1; }
+}
+
+kprobe:btrfs_delete_subvolume {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DeleteSubvolume_Enter\"}\n",
+        nsecs, tid, comm);
+    if (@send_count > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_UAF\",\"send_count\":%d}\n",
+            nsecs, tid, comm, @send_count);
+    }
+}
+
+kretprobe:btrfs_delete_subvolume {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"DeleteSubvolume_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+END {
+    clear(@send_active);
+    printf("# btrfs_send_receive trace ended.\n");
+}

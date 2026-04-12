@@ -1,0 +1,86 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_transaction_chain.bt
+ *
+ * Traces Btrfs transaction lifecycle events relevant to the
+ * BtrfsTransactionChain.tla model (ABBA deadlock between chained transactions).
+ *
+ * TLA+ model variables mapped:
+ *   tx_a_state / tx_b_state  <- derived from transaction handle state
+ *   tx_a_waiting / tx_b_waiting <- derived from wait_current_trans calls
+ *
+ * Kernel functions traced (fs/btrfs/transaction.c, Linux 6.x):
+ *   btrfs_start_transaction       - transaction start
+ *   btrfs_commit_transaction      - transaction commit
+ *   btrfs_end_transaction         - transaction end (join path)
+ *   wait_current_trans            - blocking wait for another transaction
+ *   join_transaction              - internal join
+ *
+ * Output: one JSON object per event on stdout.
+ * Run as root on a system with Btrfs mounted and CONFIG_KPROBES=y.
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_transaction_chain.bt | tee trace.jsonl
+ *   python3 ../checkers/btrfs_transaction_chain_checker.py < trace.jsonl
+ */
+
+BEGIN {
+    printf("# btrfs_transaction_chain trace started. Ctrl-C to stop.\n");
+    printf("# Each line is a JSON event compatible with BtrfsTransactionChain.tla\n");
+}
+
+/* Transaction start — maps to tx_state transition: Idle -> Running */
+kprobe:btrfs_start_transaction {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"StartTransaction\",\"num_items\":%d}\n",
+        nsecs, tid, comm, (int32)arg1);
+}
+
+kretprobe:btrfs_start_transaction {
+    /* retval is the transaction handle pointer; 0/negative = error */
+    $handle = (int64)retval;
+    if ($handle > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"StartTransaction_Done\",\"handle\":\"0x%llx\"}\n",
+            nsecs, tid, comm, (uint64)retval);
+    } else {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"StartTransaction_Error\",\"errno\":%d}\n",
+            nsecs, tid, comm, (int32)retval);
+    }
+}
+
+/* Transaction commit — maps to tx_state transition: Running -> Committed */
+kprobe:btrfs_commit_transaction {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CommitTransaction\",\"handle\":\"0x%llx\"}\n",
+        nsecs, tid, comm, (uint64)arg0);
+}
+
+kretprobe:btrfs_commit_transaction {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CommitTransaction_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+/* wait_current_trans — maps to tx_a_waiting / tx_b_waiting = TRUE */
+kprobe:wait_current_trans {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitCurrentTrans_Enter\"}\n",
+        nsecs, tid, comm);
+    @waiting[tid] = nsecs;
+}
+
+kretprobe:wait_current_trans {
+    $wait_ns = @waiting[tid];
+    if ($wait_ns > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitCurrentTrans_Done\",\"wait_us\":%llu}\n",
+            nsecs, tid, comm, (nsecs - $wait_ns) / 1000);
+        delete(@waiting[tid]);
+    }
+}
+
+/* btrfs_end_transaction — maps to tx_state: Running -> Idle (join path) */
+kprobe:btrfs_end_transaction {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"EndTransaction\",\"handle\":\"0x%llx\"}\n",
+        nsecs, tid, comm, (uint64)arg0);
+}
+
+END {
+    clear(@waiting);
+    printf("# btrfs_transaction_chain trace ended.\n");
+}

@@ -1,0 +1,76 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_dev_replace.bt
+ *
+ * Traces Btrfs device replace events relevant to the BtrfsDevReplace.tla
+ * model (lost write: write goes to old device after replace commits).
+ *
+ * TLA+ model variables mapped:
+ *   replace_state    <- "Idle" / "InProgress" / "Committed"
+ *   write_target     <- "OldDev" / "BothDevs" / "NewDev"
+ *
+ * Safety invariant checked: NoLostWrite
+ *   -> After replace commits, no write must go exclusively to the old device.
+ *
+ * Kernel functions traced (fs/btrfs/dev-replace.c, Linux 6.x):
+ *   btrfs_dev_replace_start        - start device replace
+ *   btrfs_dev_replace_finishing    - finalize replace (commit point)
+ *   btrfs_dev_replace_cancel       - cancel replace
+ *   btrfs_map_block                - block mapping (determines write targets)
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_dev_replace trace started.\n");
+    printf("# Invariant: NoLostWrite — no write to old device after replace commits\n");
+    @replace_committed = 0;
+}
+
+kprobe:btrfs_dev_replace_start {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReplaceStart\"}\n",
+        nsecs, tid, comm);
+    @replace_active = 1;
+}
+
+kprobe:btrfs_dev_replace_finishing {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReplaceFinishing\"}\n",
+        nsecs, tid, comm);
+}
+
+kretprobe:btrfs_dev_replace_finishing {
+    $ret = (int32)retval;
+    if ($ret == 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReplaceCommitted\"}\n",
+            nsecs, tid, comm);
+        @replace_committed = 1;
+        @replace_active = 0;
+    } else {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReplaceFinishing_Failed\",\"ret\":%d}\n",
+            nsecs, tid, comm, $ret);
+    }
+}
+
+kprobe:btrfs_dev_replace_cancel {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReplaceCancel\"}\n",
+        nsecs, tid, comm);
+    @replace_active = 0;
+    @replace_committed = 0;
+}
+
+kprobe:btrfs_map_block {
+    /*
+     * arg0 = fs_info, arg1 = op (READ=0, WRITE=1), arg2 = logical,
+     * arg3 = length, arg4 = bbio_ret
+     */
+    $op = (int32)arg1;
+    if ($op == 1 && @replace_committed == 1) {
+        /* Write after replace committed — check if routing is correct */
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WriteAfterReplace\",\"logical\":%llu}\n",
+            nsecs, tid, comm, (uint64)arg2);
+    }
+}
+
+END {
+    printf("# btrfs_dev_replace trace ended.\n");
+}

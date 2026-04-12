@@ -1,0 +1,11 @@
+*.class
+*.jar
+.tlaplus/
+states/
+*.tlc
+__pycache__/
+*.pyc
+*.pyo
+*.jsonl
+*.log
+.DS_Store

@@ -1,0 +1,83 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_snapshot_creation.bt
+ *
+ * Traces Btrfs snapshot creation events relevant to the
+ * BtrfsSnapshotCreation.tla model (inconsistent snapshot: write partially
+ * visible in snapshot due to race with snapshot commit).
+ *
+ * TLA+ model variables mapped:
+ *   snapshot_state   <- "Creating" / "Committed" / "Visible"
+ *   write_visible    <- TRUE if write is visible in snapshot
+ *   writer_pc        <- derived from write entry/exit
+ *   snapshot_pc      <- derived from snapshot creation entry/exit
+ *
+ * Safety invariant checked: SnapshotConsistency
+ *   -> A snapshot must represent a consistent point-in-time view.
+ *      No write that started after the snapshot transaction committed
+ *      should be visible in the snapshot.
+ *
+ * Kernel functions traced (fs/btrfs/ioctl.c, fs/btrfs/transaction.c, Linux 6.x):
+ *   btrfs_mksubvol                 - create subvolume or snapshot
+ *   create_snapshot                - internal snapshot creation
+ *   btrfs_commit_transaction       - transaction commit (snapshot point)
+ *   btrfs_copy_root                - copy root for snapshot
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_snapshot_creation trace started.\n");
+    printf("# Invariant: SnapshotConsistency — snapshot is a consistent PIT view\n");
+}
+
+kprobe:create_snapshot {
+    /*
+     * arg0 = root, arg1 = dir, arg2 = dentry, arg3 = async_transid,
+     * arg4 = readonly, arg5 = inherit
+     */
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CreateSnapshot_Enter\"}\n",
+        nsecs, tid, comm);
+    @snapshot_creating[tid] = nsecs;
+}
+kretprobe:create_snapshot {
+    $start = @snapshot_creating[tid];
+    if ($start > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CreateSnapshot_Done\",\"ret\":%d,\"dur_us\":%llu}\n",
+            nsecs, tid, comm, (int32)retval, (nsecs - $start) / 1000);
+        delete(@snapshot_creating[tid]);
+        @snapshot_count = @snapshot_count + 1;
+    }
+}
+
+kprobe:btrfs_copy_root {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CopyRoot_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:btrfs_copy_root {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CopyRoot_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_commit_transaction {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CommitTransaction_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:btrfs_commit_transaction {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CommitTransaction_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+/* Track concurrent writes during snapshot creation */
+kprobe:btrfs_file_write_iter {
+    if (@snapshot_creating[tid] > 0 || @snapshot_count > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WriteWhileSnapshot\",\"snapshot_active\":%d}\n",
+            nsecs, tid, comm, @snapshot_count);
+    }
+}
+
+END {
+    clear(@snapshot_creating);
+    printf("# btrfs_snapshot_creation trace ended. Snapshots created: %d\n",
+        @snapshot_count);
+}

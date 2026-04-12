@@ -1,0 +1,102 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_cow_path.bt
+ *
+ * Traces Btrfs COW path events relevant to the BtrfsCOWPath.tla model
+ * (CVE-2023-1611: use-after-free via concurrent COW and B-tree read).
+ *
+ * TLA+ model variables mapped:
+ *   node_state    <- "Valid" / "CoWed" / "Freed"
+ *   node_refs     <- reference count on extent buffer
+ *   reader_pc     <- derived from btrfs_search_slot entry/exit
+ *   writer_pc     <- derived from btrfs_cow_block entry/exit
+ *
+ * Safety invariant checked: NoUAF
+ *   -> A thread must not access an extent buffer after it has been freed.
+ *     Concretely: node_refs must not drop to 0 while any reader holds a pointer.
+ *
+ * Kernel functions traced (fs/btrfs/ctree.c, fs/btrfs/extent_io.c, Linux 6.x):
+ *   btrfs_search_slot        - B-tree search (reader path)
+ *   btrfs_cow_block          - COW a B-tree node (writer path)
+ *   free_extent_buffer       - decrement refcount / free
+ *   get_extent_buffer        - increment refcount
+ *   btrfs_release_path       - release all path references
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_cow_path trace started (CVE-2023-1611).\n");
+    printf("# Invariant: NoUAF — no access to freed extent buffer\n");
+}
+
+kprobe:btrfs_search_slot {
+    /*
+     * arg0 = trans, arg1 = root, arg2 = key, arg3 = path,
+     * arg4 = ins_len, arg5 = cow
+     */
+    $cow = (int32)arg5;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"SearchSlot_Enter\",\"cow\":%d}\n",
+        nsecs, tid, comm, $cow);
+    @search_start[tid] = nsecs;
+}
+
+kretprobe:btrfs_search_slot {
+    $start = @search_start[tid];
+    if ($start > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"SearchSlot_Done\",\"ret\":%d,\"dur_us\":%llu}\n",
+            nsecs, tid, comm, (int32)retval, (nsecs - $start) / 1000);
+        delete(@search_start[tid]);
+    }
+}
+
+kprobe:btrfs_cow_block {
+    /*
+     * arg0 = trans, arg1 = root, arg2 = buf (old node),
+     * arg3 = parent, arg4 = parent_slot, arg5 = cow_ret
+     */
+    $buf = (struct extent_buffer *)arg2;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CowBlock_Enter\",\"bytenr\":%llu,\"level\":%d}\n",
+        nsecs, tid, comm, $buf->start, (uint8)$buf->level);
+}
+
+kretprobe:btrfs_cow_block {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CowBlock_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:free_extent_buffer {
+    $eb = (struct extent_buffer *)arg0;
+    /* refs field is at offset 0x28 in extent_buffer (kernel 6.x) */
+    $refs = $eb->refs.counter;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FreeExtentBuffer\",\"bytenr\":%llu,\"refs_before\":%d}\n",
+        nsecs, tid, comm, $eb->start, $refs);
+    if ($refs <= 1) {
+        /* This free will drop refs to 0 — actual deallocation */
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentBuffer_Freed\",\"bytenr\":%llu}\n",
+            nsecs, tid, comm, $eb->start);
+        @freed_bufs[$eb->start] = 1;
+    }
+}
+
+kprobe:get_extent_buffer {
+    $eb = (struct extent_buffer *)arg0;
+    /* Check if we're getting a reference to an already-freed buffer */
+    if (@freed_bufs[$eb->start] == 1) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_UAF\",\"bytenr\":%llu}\n",
+            nsecs, tid, comm, $eb->start);
+    }
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"GetExtentBuffer\",\"bytenr\":%llu}\n",
+        nsecs, tid, comm, $eb->start);
+}
+
+kprobe:btrfs_release_path {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReleasePath\"}\n",
+        nsecs, tid, comm);
+}
+
+END {
+    clear(@search_start);
+    clear(@freed_bufs);
+    printf("# btrfs_cow_path trace ended.\n");
+}

@@ -1,0 +1,83 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_balance_relocation.bt
+ *
+ * Traces Btrfs balance/relocation events relevant to the
+ * BtrfsBalanceRelocation.tla model (lost write: write to old location
+ * after relocation commits the new location).
+ *
+ * TLA+ model variables mapped:
+ *   reloc_state      <- "Idle" / "Relocating" / "Committed"
+ *   block_map[b]     <- "OldLoc" / "BothLocs" / "NewLoc"
+ *   writer_pc        <- derived from write function entry/exit
+ *   relocator_pc     <- derived from relocation function entry/exit
+ *
+ * Safety invariant checked: NoLostWrite
+ *   -> After relocation commits, writes must go to the new location only.
+ *
+ * Kernel functions traced (fs/btrfs/relocation.c, Linux 6.x):
+ *   btrfs_balance                  - start balance operation
+ *   btrfs_relocate_block_group     - relocate a single block group
+ *   relocate_block_group           - internal relocation loop
+ *   btrfs_reloc_cow_block          - COW a block during relocation
+ *   merge_reloc_root               - commit relocation (merge point)
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_balance_relocation trace started.\n");
+    printf("# Invariant: NoLostWrite — no write to old location after reloc commits\n");
+}
+
+kprobe:btrfs_balance {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"Balance_Start\"}\n",
+        nsecs, tid, comm);
+    @balance_active = 1;
+}
+kretprobe:btrfs_balance {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"Balance_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+    @balance_active = 0;
+}
+
+kprobe:btrfs_relocate_block_group {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RelocateBlockGroup_Enter\",\"bg_start\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1);
+    @reloc_bg[tid] = (uint64)arg1;
+}
+kretprobe:btrfs_relocate_block_group {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RelocateBlockGroup_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+    delete(@reloc_bg[tid]);
+}
+
+kprobe:btrfs_reloc_cow_block {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RelocCowBlock\",\"bytenr\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg2);
+}
+
+kprobe:merge_reloc_root {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"MergeRelocRoot_Enter\"}\n",
+        nsecs, tid, comm);
+    @reloc_committed = 1;
+}
+kretprobe:merge_reloc_root {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"MergeRelocRoot_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+/* Detect writes to old block group after relocation committed */
+kprobe:btrfs_map_block {
+    $op      = (int32)arg1;
+    $logical = (uint64)arg2;
+    if ($op == 1 && @reloc_committed == 1) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WriteAfterReloc\",\"logical\":%llu}\n",
+            nsecs, tid, comm, $logical);
+    }
+}
+
+END {
+    clear(@reloc_bg);
+    printf("# btrfs_balance_relocation trace ended.\n");
+}

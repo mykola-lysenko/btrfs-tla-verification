@@ -1,0 +1,71 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_compression.bt
+ *
+ * Traces Btrfs compression pipeline events relevant to the
+ * BtrfsCompression.tla model (race: compressed page freed before I/O completes).
+ *
+ * TLA+ model variables mapped:
+ *   page_state     <- "Allocated" / "Compressing" / "Submitted" / "Freed"
+ *   io_state       <- "Pending" / "InFlight" / "Done"
+ *
+ * Safety invariant checked: NoUAF
+ *   -> A compressed page must not be freed while its I/O is still in flight.
+ *
+ * Kernel functions traced (fs/btrfs/compression.c, Linux 6.x):
+ *   btrfs_compress_pages           - compress a set of pages
+ *   btrfs_submit_compressed_write  - submit compressed write I/O
+ *   btrfs_submit_compressed_read   - submit compressed read I/O
+ *   end_compressed_bio_write       - I/O completion for compressed write
+ *   btrfs_put_compressed_bio       - release compressed bio (free path)
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_compression trace started.\n");
+    printf("# Invariant: NoUAF — compressed page not freed while I/O in flight\n");
+}
+
+kprobe:btrfs_compress_pages {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CompressPages_Enter\",\"type\":%d}\n",
+        nsecs, tid, comm, (int32)arg0);
+}
+kretprobe:btrfs_compress_pages {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CompressPages_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, (int32)retval);
+}
+
+kprobe:btrfs_submit_compressed_write {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"SubmitCompressedWrite\",\"start\":%llu,\"len\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg1, (uint64)arg2);
+    @inflight_writes[tid] = @inflight_writes[tid] + 1;
+}
+
+kprobe:btrfs_submit_compressed_read {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"SubmitCompressedRead\",\"start\":%llu,\"len\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg2, (uint64)arg3);
+}
+
+kprobe:end_compressed_bio_write {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"EndCompressedBioWrite\",\"error\":%d}\n",
+        nsecs, tid, comm, (int32)arg1);
+    if (@inflight_writes[tid] > 0) {
+        @inflight_writes[tid] = @inflight_writes[tid] - 1;
+    }
+}
+
+kprobe:btrfs_put_compressed_bio {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"PutCompressedBio\"}\n",
+        nsecs, tid, comm);
+    /* If inflight_writes > 0 when freeing, that's a potential UAF */
+    if (@inflight_writes[tid] > 0) {
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_UAF\",\"inflight\":%d}\n",
+            nsecs, tid, comm, @inflight_writes[tid]);
+    }
+}
+
+END {
+    clear(@inflight_writes);
+    printf("# btrfs_compression trace ended.\n");
+}

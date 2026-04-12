@@ -1,0 +1,94 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_space_reservation.bt
+ *
+ * Traces Btrfs space reservation events relevant to the
+ * BtrfsSpaceReservation.tla model (over-commit leading to ENOSPC deadlock).
+ *
+ * TLA+ model variables mapped:
+ *   reserved_bytes    <- running total of reserved but uncommitted bytes
+ *   committed_bytes   <- running total of committed bytes
+ *   total_bytes       <- filesystem size
+ *
+ * Safety invariant checked: NoOverCommit
+ *   -> reserved_bytes + committed_bytes must never exceed total_bytes.
+ *
+ * Liveness property: NoStarvation
+ *   -> Every reservation request eventually either succeeds or returns ENOSPC.
+ *
+ * Kernel functions traced (fs/btrfs/space-info.c, Linux 6.x):
+ *   btrfs_reserve_metadata_bytes    - reserve metadata space
+ *   btrfs_unreserve_metadata_bytes  - release reservation
+ *   btrfs_space_info_update_bytes_may_use - update may-use counter
+ *   btrfs_calc_reclaim_metadata_size - reclaim calculation
+ *   btrfs_async_reclaim_metadata_space - trigger async reclaim
+ *
+ * Output: one JSON object per event on stdout.
+ */
+
+BEGIN {
+    printf("# btrfs_space_reservation trace started.\n");
+    printf("# Invariant: NoOverCommit — reserved + committed <= total\n");
+}
+
+kprobe:btrfs_reserve_metadata_bytes {
+    /*
+     * arg0 = root, arg1 = block_rsv, arg2 = orig_bytes, arg3 = flush
+     */
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveMetadata_Enter\",\"bytes\":%llu,\"flush\":%d}\n",
+        nsecs, tid, comm, (uint64)arg2, (int32)arg3);
+    @reserve_start[tid] = nsecs;
+    @reserve_bytes[tid] = (uint64)arg2;
+}
+
+kretprobe:btrfs_reserve_metadata_bytes {
+    $start = @reserve_start[tid];
+    $bytes = @reserve_bytes[tid];
+    $ret   = (int32)retval;
+    if ($start > 0) {
+        if ($ret == 0) {
+            printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveMetadata_OK\",\"bytes\":%llu,\"wait_us\":%llu}\n",
+                nsecs, tid, comm, $bytes, (nsecs - $start) / 1000);
+            @total_reserved = @total_reserved + $bytes;
+        } else {
+            printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveMetadata_ENOSPC\",\"bytes\":%llu,\"errno\":%d}\n",
+                nsecs, tid, comm, $bytes, $ret);
+        }
+        delete(@reserve_start[tid]);
+        delete(@reserve_bytes[tid]);
+    }
+}
+
+kprobe:btrfs_unreserve_metadata_bytes {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"UnreserveMetadata\",\"bytes\":%llu}\n",
+        nsecs, tid, comm, (uint64)arg2);
+    if (@total_reserved >= (uint64)arg2) {
+        @total_reserved = @total_reserved - (uint64)arg2;
+    }
+}
+
+kprobe:btrfs_async_reclaim_metadata_space {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AsyncReclaim_Triggered\"}\n",
+        nsecs, tid, comm);
+}
+
+kprobe:btrfs_space_info_update_bytes_may_use {
+    /*
+     * arg0 = fs_info, arg1 = space_info, arg2 = bytes (signed delta)
+     */
+    $delta = (int64)arg2;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"UpdateBytesMAyUse\",\"delta\":%lld}\n",
+        nsecs, tid, comm, $delta);
+}
+
+interval:s:5 {
+    printf("{\"ts\":%llu,\"action\":\"PeriodicStats\",\"total_reserved_bytes\":%llu}\n",
+        nsecs, @total_reserved);
+}
+
+END {
+    clear(@reserve_start);
+    clear(@reserve_bytes);
+    printf("# btrfs_space_reservation trace ended. Total reserved at exit: %llu bytes\n",
+        @total_reserved);
+}
