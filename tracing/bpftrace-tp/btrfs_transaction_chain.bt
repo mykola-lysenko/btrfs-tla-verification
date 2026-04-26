@@ -1,0 +1,147 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_transaction_chain.bt  [tracepoint edition]
+ * --------------------------------------------------
+ * Traces Btrfs transaction lifecycle and ordered extent interactions.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsTransactionChain.tla
+ * Invariant:  NoDeadlock — TRANS_JOIN must not wait for a committing tx
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_transaction_commit  — transaction committed
+ *   btrfs:btrfs_sync_file           — fsync called (triggers log commit)
+ *   btrfs:btrfs_sync_fs             — sync() called (triggers tx commit)
+ *   btrfs:btrfs_ordered_extent_add  — ordered extent created
+ *   btrfs:btrfs_ordered_extent_start— ordered extent I/O started
+ *   btrfs:btrfs_finish_ordered_extent — ordered extent completed
+ *   btrfs:btrfs_space_reservation   — metadata reservation (proxy for TRANS_JOIN)
+ *   btrfs:btrfs_trigger_flush       — space flush triggered (commit pressure)
+ *   btrfs:btrfs_flush_space         — space flush action taken
+ *
+ * NOTE: There is no direct tracepoint for btrfs_start_transaction or
+ *       wait_current_trans. We use btrfs_space_reservation as a proxy:
+ *       a reservation with type="delayed_refs" or "delayed_inode" is
+ *       made inside TRANS_JOIN paths. A long gap between reservation
+ *       and the next commit is the deadlock signal.
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_transaction_chain.bt | \
+ *     python3 ../checkers/btrfs_transaction_chain_checker.py
+ */
+
+BEGIN {
+    printf("# btrfs_transaction_chain.bt [tracepoint] started\n");
+}
+
+/* Transaction committed — marks end of a transaction */
+tracepoint:btrfs:btrfs_transaction_commit {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"CommitTransaction_Done\","
+           "\"gen\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->generation, nsecs);
+    @last_commit_ts = nsecs;
+    @last_commit_gen = args->generation;
+}
+
+/* fsync called — triggers log tree commit (lighter than full tx commit) */
+tracepoint:btrfs:btrfs_sync_file {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFile\","
+           "\"ino\":%llu,\"root\":%llu,\"datasync\":%d,\"ts\":%llu}\n",
+        tid, comm, args->ino, args->root_objectid, args->datasync, nsecs);
+    @sync_file_ts[tid] = nsecs;
+}
+
+/* sync() called — triggers full transaction commit */
+tracepoint:btrfs:btrfs_sync_fs {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFs\","
+           "\"wait\":%d,\"ts\":%llu}\n",
+        tid, comm, args->wait, nsecs);
+    if (args->wait == 1) {
+        @commit_start_ts[tid] = nsecs;
+    }
+}
+
+/* Ordered extent added — this is the "in-flight write" that must complete
+ * before a transaction can commit. This is the key ingredient for the
+ * CVE-2025-71194 deadlock. */
+tracepoint:btrfs:btrfs_ordered_extent_add {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\","
+           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,\"ts\":%llu}\n",
+        tid, comm,
+        args->ino, args->file_offset, args->len, args->flags, nsecs);
+    @ordered_count++;
+    @ordered_by_tid[tid]++;
+}
+
+/* Ordered extent I/O started */
+tracepoint:btrfs:btrfs_ordered_extent_start {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Start\","
+           "\"ino\":%llu,\"offset\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->ino, args->file_offset, nsecs);
+}
+
+/* Ordered extent completed — decrements the in-flight count */
+tracepoint:btrfs:btrfs_finish_ordered_extent {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Finish\","
+           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"uptodate\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->ino, args->start, args->len, args->uptodate, nsecs);
+    if (@ordered_count > 0) { @ordered_count--; }
+    if (@ordered_by_tid[tid] > 0) { @ordered_by_tid[tid]--; }
+}
+
+/*
+ * Space reservation — proxy for transaction join paths.
+ * reserve=1 means reserving, reserve=0 means releasing.
+ * type="delayed_refs" or "delayed_inode" indicates TRANS_JOIN-style paths.
+ * A long-running reservation with no subsequent commit = potential deadlock.
+ */
+tracepoint:btrfs:btrfs_space_reservation {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SpaceReservation\","
+           "\"type\":\"%s\",\"val\":%llu,\"bytes\":%llu,\"reserve\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        str(args->type), args->val, args->bytes, args->reserve, nsecs);
+
+    if (args->reserve == 1) {
+        @rsv_start[tid] = nsecs;
+        @rsv_type[tid]  = str(args->type);
+    } else {
+        delete(@rsv_start[tid]);
+        delete(@rsv_type[tid]);
+    }
+}
+
+/* Space flush triggered — indicates the system is under reservation pressure */
+tracepoint:btrfs:btrfs_trigger_flush {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TriggerFlush\","
+           "\"flags\":%llu,\"bytes\":%llu,\"flush\":%d,\"reason\":\"%s\",\"ts\":%llu}\n",
+        tid, comm,
+        args->flags, args->bytes, args->flush, str(args->reason), nsecs);
+}
+
+/* Space flush action */
+tracepoint:btrfs:btrfs_flush_space {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FlushSpace\","
+           "\"flags\":%llu,\"num_bytes\":%llu,\"flush\":%d,\"ret\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->flags, args->num_bytes, args->flush, args->ret, nsecs);
+}
+
+/*
+ * Periodic stats: report in-flight ordered extents and pending reservations.
+ * High ordered_count + pending commit = deadlock risk window.
+ */
+interval:s:5 {
+    printf("{\"action\":\"PeriodicStats\","
+           "\"ordered_in_flight\":%lld,"
+           "\"ts\":%llu}\n",
+        @ordered_count, nsecs);
+}
+
+END {
+    clear(@last_commit_ts); clear(@last_commit_gen);
+    clear(@sync_file_ts); clear(@commit_start_ts);
+    clear(@ordered_count); clear(@ordered_by_tid);
+    clear(@rsv_start); clear(@rsv_type);
+    printf("# btrfs_transaction_chain.bt ended\n");
+}

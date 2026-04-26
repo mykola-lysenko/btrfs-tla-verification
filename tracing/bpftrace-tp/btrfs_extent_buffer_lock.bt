@@ -1,0 +1,102 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_extent_buffer_lock.bt  [tracepoint edition]
+ * --------------------------------------------------
+ * Traces Btrfs extent buffer lock events using stable tracepoints.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsExtentBufferLock.tla
+ * Invariant:  NoDeadlock — top-down lock ordering (higher level first)
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_tree_lock        — write lock acquired (after wait)
+ *   btrfs:btrfs_tree_read_lock   — read lock acquired (after wait)
+ *   btrfs:btrfs_tree_unlock      — write lock released
+ *   btrfs:btrfs_tree_read_unlock — read lock released
+ *   btrfs:btrfs_cow_block        — COW path (shows buf_level, cow_level)
+ *
+ * NOTE: btrfs_tree_lock fires AFTER the lock is acquired (not before).
+ *       diff_ns = time spent waiting. diff_ns > 0 means there was contention.
+ *       owner = root objectid (proxy for which tree this node belongs to).
+ *       is_log_tree = 1 for log tree nodes (separate lock domain).
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_extent_buffer_lock.bt | \
+ *     python3 ../checkers/btrfs_extent_buffer_lock_checker.py
+ */
+
+BEGIN {
+    printf("# btrfs_extent_buffer_lock.bt [tracepoint] started\n");
+}
+
+/* Write lock acquired — fires after the lock is held */
+tracepoint:btrfs:btrfs_tree_lock {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireWrite\","
+           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"wait_ns\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->block, args->owner, args->is_log_tree, args->diff_ns, nsecs);
+    @write_held[tid] = args->block;
+    @write_owner[tid] = args->owner;
+    @write_ts[tid] = nsecs;
+}
+
+/* Read lock acquired — fires after the lock is held */
+tracepoint:btrfs:btrfs_tree_read_lock {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireRead\","
+           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"wait_ns\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->block, args->owner, args->is_log_tree, args->diff_ns, nsecs);
+    @read_held[tid] = args->block;
+}
+
+/* Write lock released */
+tracepoint:btrfs:btrfs_tree_unlock {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"Release\","
+           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->block, args->owner, args->is_log_tree, nsecs);
+    delete(@write_held[tid]);
+    delete(@write_owner[tid]);
+    delete(@write_ts[tid]);
+}
+
+/* Read lock released */
+tracepoint:btrfs:btrfs_tree_read_unlock {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReleaseRead\","
+           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->block, args->owner, args->is_log_tree, nsecs);
+    delete(@read_held[tid]);
+}
+
+/*
+ * COW block: shows the level of the buffer being COWed.
+ * The COW path acquires locks top-down (root first, leaf last).
+ * buf_level and cow_level should always be equal (COW preserves level).
+ * If they differ, that is a structural anomaly.
+ */
+tracepoint:btrfs:btrfs_cow_block {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
+           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
+           "\"cow_block\":%llu,\"cow_level\":%d,\"refs\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->root_objectid, args->buf_start, args->buf_level,
+        args->cow_start, args->cow_level, args->refs, nsecs);
+
+    if (args->buf_level != args->cow_level) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_LevelMismatch\","
+               "\"buf_level\":%d,\"cow_level\":%d,\"ts\":%llu}\n",
+            tid, args->buf_level, args->cow_level, nsecs);
+    }
+}
+
+/* Periodic: report threads currently holding write locks */
+interval:s:5 {
+    printf("{\"action\":\"PeriodicStats\",\"write_holders\":%lld,\"ts\":%llu}\n",
+        count(@write_held), nsecs);
+}
+
+END {
+    clear(@write_held); clear(@write_owner); clear(@write_ts); clear(@read_held);
+    printf("# btrfs_extent_buffer_lock.bt ended\n");
+}

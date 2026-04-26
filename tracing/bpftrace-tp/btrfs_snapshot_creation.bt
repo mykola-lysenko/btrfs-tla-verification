@@ -1,0 +1,87 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_snapshot_creation.bt  [tracepoint edition]
+ * --------------------------------------------------
+ * Traces Btrfs snapshot creation operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsSnapshotCreation.tla
+ * Invariant:  SnapshotConsistency — snapshot must reflect a consistent point-in-time
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_transaction_commit    — transaction committed (snapshot persisted)
+ *   btrfs:btrfs_ordered_extent_add    — ordered extent created (write in progress)
+ *   btrfs:btrfs_ordered_extent_remove — ordered extent completed
+ *   btrfs:btrfs_cow_block             — COW during snapshot (shared blocks)
+ *   btrfs:btrfs_sync_fs               — sync() called (snapshot trigger)
+ *
+ * Snapshot consistency check:
+ *   A snapshot is consistent if no ordered extents are in-flight at the
+ *   moment the transaction commits. If ordered extents are active when
+ *   the commit fires, the snapshot may capture a partial write.
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_snapshot_creation.bt
+ */
+
+BEGIN {
+    printf("# btrfs_snapshot_creation.bt [tracepoint] started\n");
+    @oe_count = 0;
+}
+
+tracepoint:btrfs:btrfs_ordered_extent_add {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\","
+           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,\"ts\":%llu}\n",
+        tid, comm,
+        args->ino, args->file_offset, args->len, args->flags, nsecs);
+    @oe_count++;
+    @oe_by_ino[args->ino]++;
+}
+
+tracepoint:btrfs:btrfs_ordered_extent_remove {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Remove\","
+           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->ino, args->file_offset, args->len, nsecs);
+    if (@oe_count > 0) { @oe_count--; }
+    if (@oe_by_ino[args->ino] > 0) { @oe_by_ino[args->ino]--; }
+}
+
+tracepoint:btrfs:btrfs_transaction_commit {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\","
+           "\"gen\":%llu,\"oe_in_flight\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->generation, @oe_count, nsecs);
+
+    /* Consistency check: ordered extents in flight during commit */
+    if (@oe_count > 0) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_SnapshotInconsistent\","
+               "\"oe_in_flight\":%lld,\"gen\":%llu,\"ts\":%llu}\n",
+            tid, @oe_count, args->generation, nsecs);
+    }
+}
+
+tracepoint:btrfs:btrfs_cow_block {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
+           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
+           "\"cow_block\":%llu,\"refs\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->root_objectid, args->buf_start, args->buf_level,
+        args->cow_start, args->refs, nsecs);
+}
+
+tracepoint:btrfs:btrfs_sync_fs {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFs\","
+           "\"wait\":%d,\"oe_in_flight\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->wait, @oe_count, nsecs);
+}
+
+interval:s:5 {
+    printf("{\"action\":\"PeriodicStats\","
+           "\"oe_in_flight\":%lld,\"ts\":%llu}\n",
+        @oe_count, nsecs);
+}
+
+END {
+    clear(@oe_count); clear(@oe_by_ino);
+    printf("# btrfs_snapshot_creation.bt ended\n");
+}

@@ -1,0 +1,129 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_space_reservation.bt  [tracepoint edition]
+ * --------------------------------------------------
+ * Traces Btrfs space reservation and flush operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsSpaceReservation.tla
+ * Invariants: NoOverCommit, NoStarvation
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_space_reservation  — reserve/release metadata space
+ *   btrfs:btrfs_trigger_flush      — flush triggered (approaching limit)
+ *   btrfs:btrfs_flush_space        — flush action taken
+ *   btrfs:btrfs_reserve_ticket     — reservation ticket (blocking wait)
+ *   btrfs:update_bytes_may_use     — bytes_may_use counter updated
+ *   btrfs:update_bytes_pinned      — bytes_pinned counter updated
+ *
+ * btrfs_space_reservation fields:
+ *   type    — reservation type string (e.g., "delalloc", "delayed_refs",
+ *              "delayed_inode", "trans", "chunk")
+ *   val     — inode/root/block group identifier
+ *   bytes   — number of bytes reserved/released
+ *   reserve — 1=reserve, 0=release
+ *
+ * btrfs_reserve_ticket fields:
+ *   flags     — space info flags (DATA/METADATA/SYSTEM)
+ *   bytes     — bytes requested
+ *   start_ns  — when the ticket was created
+ *   flush     — flush state when ticket was created
+ *   error     — 0=success, -ENOSPC=failed
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_space_reservation.bt
+ */
+
+BEGIN {
+    printf("# btrfs_space_reservation.bt [tracepoint] started\n");
+    @total_reserved = 0;
+    @enospc_count = 0;
+}
+
+tracepoint:btrfs:btrfs_space_reservation {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SpaceReservation\","
+           "\"type\":\"%s\",\"val\":%llu,\"bytes\":%llu,\"reserve\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        str(args->type), args->val, args->bytes, args->reserve, nsecs);
+
+    if (args->reserve == 1) {
+        @total_reserved += args->bytes;
+        @rsv_by_type[str(args->type)] += args->bytes;
+    } else {
+        @total_reserved -= args->bytes;
+        @rsv_by_type[str(args->type)] -= args->bytes;
+    }
+}
+
+tracepoint:btrfs:btrfs_trigger_flush {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TriggerFlush\","
+           "\"flags\":%llu,\"bytes\":%llu,\"flush\":%d,\"reason\":\"%s\",\"ts\":%llu}\n",
+        tid, comm,
+        args->flags, args->bytes, args->flush, str(args->reason), nsecs);
+    @flush_count++;
+}
+
+tracepoint:btrfs:btrfs_flush_space {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FlushSpace\","
+           "\"flags\":%llu,\"num_bytes\":%llu,\"flush\":%d,\"ret\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->flags, args->num_bytes, args->flush, args->ret, nsecs);
+
+    if (args->ret != 0) {
+        @flush_errors++;
+    }
+}
+
+/*
+ * Reservation ticket: a thread is blocking waiting for space.
+ * error != 0 means the reservation ultimately failed (ENOSPC).
+ * Long wait_ns (start_ns to now) with error=0 is a starvation signal.
+ */
+tracepoint:btrfs:btrfs_reserve_ticket {
+    $wait_ns = nsecs - args->start_ns;
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveTicket\","
+           "\"flags\":%llu,\"bytes\":%llu,\"wait_ns\":%llu,\"flush\":%d,\"error\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->flags, args->bytes, $wait_ns, args->flush, args->error, nsecs);
+
+    if (args->error != 0) {
+        @enospc_count++;
+        printf("{\"tid\":%d,\"action\":\"ReserveTicket_ENOSPC\","
+               "\"bytes\":%llu,\"wait_ns\":%llu,\"ts\":%llu}\n",
+            tid, args->bytes, $wait_ns, nsecs);
+    }
+
+    /* Starvation: waited > 5 seconds and still got space */
+    if ($wait_ns > 5000000000 && args->error == 0) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_Starvation\","
+               "\"bytes\":%llu,\"wait_ns\":%llu,\"ts\":%llu}\n",
+            tid, args->bytes, $wait_ns, nsecs);
+    }
+}
+
+tracepoint:btrfs:update_bytes_may_use {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UpdateBytesMayUse\","
+           "\"sinfo_flags\":%llu,\"delta\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->sinfo_flags, args->delta, nsecs);
+}
+
+tracepoint:btrfs:update_bytes_pinned {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UpdateBytesPinned\","
+           "\"sinfo_flags\":%llu,\"delta\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->sinfo_flags, args->delta, nsecs);
+}
+
+interval:s:5 {
+    printf("{\"action\":\"PeriodicStats\","
+           "\"total_reserved\":%lld,\"flush_count\":%lld,"
+           "\"flush_errors\":%lld,\"enospc_count\":%lld,\"ts\":%llu}\n",
+        @total_reserved, @flush_count, @flush_errors, @enospc_count, nsecs);
+}
+
+END {
+    print(@rsv_by_type);
+    clear(@total_reserved); clear(@enospc_count);
+    clear(@flush_count); clear(@flush_errors);
+    clear(@rsv_by_type);
+    printf("# btrfs_space_reservation.bt ended\n");
+}

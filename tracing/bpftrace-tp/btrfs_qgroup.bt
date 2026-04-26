@@ -1,0 +1,141 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_qgroup.bt  [tracepoint edition]
+ * ---------------------------------------
+ * Traces Btrfs qgroup accounting operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsQgroupRescan.tla
+ * Invariant:  NoUAF — qgroup records must not be freed while rescan iterates
+ *
+ * Tracepoints:
+ *   btrfs:qgroup_meta_reserve      — metadata reservation (quota accounting)
+ *   btrfs:qgroup_meta_convert      — reservation type conversion
+ *   btrfs:qgroup_meta_free_all_pertrans — all per-transaction reservations freed
+ *   btrfs:btrfs_qgroup_account_extent — extent accounted to qgroup
+ *   btrfs:qgroup_num_dirty_extents — number of dirty extents in qgroup
+ *   btrfs:btrfs_qgroup_account_extents — batch extent accounting
+ *   btrfs:qgroup_update_counters   — qgroup counters updated
+ *   btrfs:qgroup_update_reserve    — qgroup reservation updated
+ *
+ * NOTE: There is no direct tracepoint for btrfs_quota_enable/disable or
+ *       the rescan worker. We use qgroup_meta_reserve as a proxy:
+ *       if reservations happen after qgroup_update_counters stops firing,
+ *       the qgroup tree may have been freed (UAF window).
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_qgroup.bt | \
+ *     python3 ../checkers/btrfs_qgroup_checker.py
+ */
+
+BEGIN {
+    printf("# btrfs_qgroup.bt [tracepoint] started\n");
+    @qgroup_active = 0;
+    @rescan_active = 0;
+}
+
+/* Metadata reservation — fired when quota is enabled and a reservation is made */
+tracepoint:btrfs:qgroup_meta_reserve {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupMetaReserve\","
+           "\"refroot\":%llu,\"diff\":%lld,\"type\":%d,\"ts\":%llu}\n",
+        tid, comm, args->refroot, args->diff, args->type, nsecs);
+
+    if (args->diff > 0) {
+        @qgroup_active = 1;
+        @rsv_count++;
+    } else {
+        if (@rsv_count > 0) { @rsv_count--; }
+    }
+}
+
+/* Reservation type conversion (e.g., prealloc -> pertrans) */
+tracepoint:btrfs:qgroup_meta_convert {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupMetaConvert\","
+           "\"refroot\":%llu,\"diff\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->refroot, args->diff, nsecs);
+}
+
+/* All per-transaction reservations freed — happens at transaction commit */
+tracepoint:btrfs:qgroup_meta_free_all_pertrans {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupFreeAllPertrans\","
+           "\"refroot\":%llu,\"diff\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->refroot, args->diff, nsecs);
+}
+
+/* Extent accounted to qgroup — this is the rescan worker's main operation */
+tracepoint:btrfs:btrfs_qgroup_account_extent {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupAccountExtent\","
+           "\"bytenr\":%llu,\"num_bytes\":%llu,\"nr_old_roots\":%llu,\"nr_new_roots\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->num_bytes, args->nr_old_roots, args->nr_new_roots, nsecs);
+
+    /* Track that rescan is active (accounting extents) */
+    @rescan_active = 1;
+    @last_rescan_ts = nsecs;
+    @rescan_extents++;
+}
+
+/* Number of dirty extents pending qgroup accounting */
+tracepoint:btrfs:qgroup_num_dirty_extents {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupDirtyExtents\","
+           "\"generation\":%llu,\"num_dirty_extents\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->generation, args->num_dirty_extents, nsecs);
+}
+
+/* Batch extent accounting */
+tracepoint:btrfs:btrfs_qgroup_account_extents {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupAccountExtents\","
+           "\"num_dirty_extents\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->num_dirty_extents, nsecs);
+
+    if (args->num_dirty_extents == 0) {
+        /* Rescan complete */
+        @rescan_active = 0;
+        printf("{\"tid\":%d,\"action\":\"QgroupRescan_Done\","
+               "\"total_extents\":%lld,\"ts\":%llu}\n",
+            tid, @rescan_extents, nsecs);
+        @rescan_extents = 0;
+    }
+}
+
+/* Qgroup counters updated — fired during rescan and normal accounting */
+tracepoint:btrfs:qgroup_update_counters {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupUpdateCounters\","
+           "\"qgid\":%llu,\"old_rfer\":%llu,\"old_excl\":%llu,"
+           "\"cur_old_count\":%llu,\"cur_new_count\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->qgid, args->old_rfer, args->old_excl,
+        args->cur_old_count, args->cur_new_count, nsecs);
+}
+
+/* Qgroup reservation updated */
+tracepoint:btrfs:qgroup_update_reserve {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupUpdateReserve\","
+           "\"qgid\":%llu,\"cur_reserved\":%llu,\"diff\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->qgid, args->cur_reserved, args->diff, nsecs);
+}
+
+/*
+ * Periodic check: if rescan is active and no accounting events have fired
+ * for > 2s, the rescan worker may have been killed by a UAF (CVE-2025-39759).
+ */
+interval:s:2 {
+    if (@rescan_active == 1) {
+        $gap = nsecs - @last_rescan_ts;
+        if ($gap > 2000000000) {
+            printf("{\"action\":\"VIOLATION_RescanStalled\","
+                   "\"gap_ns\":%llu,\"ts\":%llu}\n",
+                $gap, nsecs);
+        }
+    }
+    printf("{\"action\":\"PeriodicStats\","
+           "\"qgroup_active\":%lld,\"rescan_active\":%lld,"
+           "\"rsv_count\":%lld,\"ts\":%llu}\n",
+        @qgroup_active, @rescan_active, @rsv_count, nsecs);
+}
+
+END {
+    clear(@qgroup_active); clear(@rescan_active); clear(@rsv_count);
+    clear(@last_rescan_ts); clear(@rescan_extents);
+    printf("# btrfs_qgroup.bt ended\n");
+}

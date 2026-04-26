@@ -1,0 +1,78 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_compression.bt  [tracepoint edition]
+ * --------------------------------------------
+ * Traces Btrfs compression pipeline operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsCompression.tla
+ * Invariant:  CompressionConsistency — compressed extent must decompress to original
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_ordered_extent_add    — write with compression flag
+ *   btrfs:btrfs_ordered_extent_start  — compression I/O started
+ *   btrfs:btrfs_ordered_extent_remove — compression completed
+ *   btrfs:btrfs_reserved_extent_alloc — compressed extent allocated
+ *   btrfs:btrfs_reserved_extent_free  — compressed extent freed
+ *
+ * compress_type values (from ordered extent flags):
+ *   0 = NONE, 1 = ZLIB, 2 = LZO, 3 = ZSTD
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_compression.bt
+ */
+
+BEGIN {
+    printf("# btrfs_compression.bt [tracepoint] started\n");
+}
+
+tracepoint:btrfs:btrfs_ordered_extent_add {
+    if (args->compress_type > 0) {
+        printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"CompressedWrite_Add\","
+               "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,"
+               "\"disk_len\":%llu,\"compress_type\":%d,\"ts\":%llu}\n",
+            tid, comm,
+            args->ino, args->file_offset, args->len,
+            args->disk_len, args->compress_type, nsecs);
+        @compress_pending[args->ino, args->file_offset] = args->compress_type;
+        @compress_ratio[args->compress_type] = args->len;
+    }
+}
+
+tracepoint:btrfs:btrfs_ordered_extent_start {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Start\","
+           "\"ino\":%llu,\"offset\":%llu,\"compress\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->ino, args->file_offset, args->compress_type, nsecs);
+}
+
+tracepoint:btrfs:btrfs_ordered_extent_remove {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Remove\","
+           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"compress\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->ino, args->file_offset, args->len, args->compress_type, nsecs);
+    delete(@compress_pending[args->ino, args->file_offset]);
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_alloc {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_free {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+}
+
+interval:s:5 {
+    printf("{\"action\":\"PeriodicStats\","
+           "\"compress_pending\":%lld,\"ts\":%llu}\n",
+        count(@compress_pending), nsecs);
+}
+
+END {
+    clear(@compress_pending); clear(@compress_ratio);
+    printf("# btrfs_compression.bt ended\n");
+}

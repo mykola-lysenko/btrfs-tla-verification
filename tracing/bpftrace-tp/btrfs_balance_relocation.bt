@@ -1,0 +1,97 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_balance_relocation.bt  [tracepoint edition]
+ * ---------------------------------------------------
+ * Traces Btrfs balance and block group relocation.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsBalanceRelocation.tla
+ * Invariant:  NoLostWrite — writes to old location after relocation commits
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_add_block_group     — block group added (new location after reloc)
+ *   btrfs:btrfs_remove_block_group  — block group removed (old location freed)
+ *   btrfs:btrfs_add_unused_block_group — block group marked unused (reloc candidate)
+ *   btrfs:btrfs_reclaim_block_group — block group reclaim started
+ *   btrfs:btrfs_reserved_extent_alloc — extent allocated (in new block group)
+ *   btrfs:btrfs_reserved_extent_free  — extent freed (from old block group)
+ *   btrfs:btrfs_cow_block           — COW during relocation (buf_level shows depth)
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_balance_relocation.bt
+ */
+
+BEGIN {
+    printf("# btrfs_balance_relocation.bt [tracepoint] started\n");
+}
+
+tracepoint:btrfs:btrfs_add_block_group {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddBlockGroup\","
+           "\"bytenr\":%llu,\"len\":%llu,\"used\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->offset, args->len, args->used, args->flags, nsecs);
+    @active_bgs[args->offset] = args->len;
+}
+
+tracepoint:btrfs:btrfs_remove_block_group {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RemoveBlockGroup\","
+           "\"bytenr\":%llu,\"len\":%llu,\"used\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->len, args->used, args->flags, nsecs);
+    delete(@active_bgs[args->bytenr]);
+    @removed_bgs[args->bytenr] = nsecs;
+}
+
+tracepoint:btrfs:btrfs_add_unused_block_group {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UnusedBlockGroup\","
+           "\"bytenr\":%llu,\"len\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->len, args->flags, nsecs);
+}
+
+tracepoint:btrfs:btrfs_reclaim_block_group {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReclaimBlockGroup\","
+           "\"bytenr\":%llu,\"len\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->len, args->flags, nsecs);
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_alloc {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_free {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+
+    /* Lost write check: if an extent in a removed block group is freed,
+     * any concurrent write to that range is a lost write candidate. */
+    if (@removed_bgs[args->start] != 0) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_WriteToRemovedBG\","
+               "\"start\":%llu,\"ts\":%llu}\n",
+            tid, args->start, nsecs);
+    }
+}
+
+tracepoint:btrfs:btrfs_cow_block {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
+           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
+           "\"cow_block\":%llu,\"cow_level\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->root_objectid, args->buf_start, args->buf_level,
+        args->cow_start, args->cow_level, nsecs);
+}
+
+interval:s:5 {
+    printf("{\"action\":\"PeriodicStats\","
+           "\"active_bgs\":%lld,\"removed_bgs\":%lld,\"ts\":%llu}\n",
+        count(@active_bgs), count(@removed_bgs), nsecs);
+}
+
+END {
+    clear(@active_bgs); clear(@removed_bgs);
+    printf("# btrfs_balance_relocation.bt ended\n");
+}

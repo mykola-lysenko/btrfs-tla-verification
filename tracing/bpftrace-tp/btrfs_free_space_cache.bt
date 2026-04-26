@@ -1,0 +1,112 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_free_space_cache.bt  [tracepoint edition]
+ * -------------------------------------------------
+ * Traces Btrfs free space cache operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsFreeSpaceCache.tla
+ * Invariant:  NoDoubleAdd — same bytenr must not be added twice to cache
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_reserved_extent_alloc — extent allocated (removed from free cache)
+ *   btrfs:btrfs_reserved_extent_free  — extent freed (added back to free cache)
+ *   btrfs:find_free_extent             — free extent search started
+ *   btrfs:find_free_extent_search_loop — search loop iteration
+ *   btrfs:find_free_extent_have_block_group — block group candidate found
+ *   btrfs:btrfs_reserve_extent         — extent reserved from block group
+ *   btrfs:btrfs_reserve_extent_cluster — extent reserved from cluster
+ *
+ * Double-add detection:
+ *   If btrfs_reserved_extent_free fires twice for the same start address
+ *   without an intervening btrfs_reserved_extent_alloc, that is a double-add.
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_free_space_cache.bt | \
+ *     python3 ../checkers/btrfs_free_space_cache_checker.py
+ */
+
+BEGIN {
+    printf("# btrfs_free_space_cache.bt [tracepoint] started\n");
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_alloc {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+
+    if (@free_set[args->start] == 0) {
+        /* Allocated an extent that wasn't in the free set — possible corruption */
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_AllocNotFree\","
+               "\"start\":%llu,\"ts\":%llu}\n",
+            tid, args->start, nsecs);
+    }
+    delete(@free_set[args->start]);
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_free {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+
+    /* Double-add detection */
+    if (@free_set[args->start] != 0) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_DoubleAdd\","
+               "\"start\":%llu,\"prev_ts\":%llu,\"ts\":%llu}\n",
+            tid, args->start, @free_set[args->start], nsecs);
+    }
+    @free_set[args->start] = nsecs;
+}
+
+tracepoint:btrfs:find_free_extent {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent\","
+           "\"root\":%llu,\"num_bytes\":%llu,\"empty_size\":%llu,"
+           "\"data\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->root_objectid, args->num_bytes, args->empty_size,
+        args->data, nsecs);
+}
+
+tracepoint:btrfs:find_free_extent_search_loop {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent_Loop\","
+           "\"root\":%llu,\"loop\":%u,\"ts\":%llu}\n",
+        tid, comm, args->root_objectid, args->loop, nsecs);
+}
+
+tracepoint:btrfs:find_free_extent_have_block_group {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent_HaveBG\","
+           "\"root\":%llu,\"flags\":%llu,\"empty_size\":%llu,"
+           "\"min_bytes\":%llu,\"loop\":%u,\"ts\":%llu}\n",
+        tid, comm,
+        args->root_objectid, args->flags, args->empty_size,
+        args->min_bytes, args->loop, nsecs);
+}
+
+tracepoint:btrfs:btrfs_reserve_extent {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveExtent\","
+           "\"bg_offset\":%llu,\"num_bytes\":%llu,\"search_start\":%llu,"
+           "\"empty_cluster\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bg_offset, args->num_bytes, args->search_start,
+        args->empty_cluster, nsecs);
+}
+
+tracepoint:btrfs:btrfs_reserve_extent_cluster {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveExtentCluster\","
+           "\"bg_offset\":%llu,\"num_bytes\":%llu,\"search_start\":%llu,"
+           "\"empty_cluster\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bg_offset, args->num_bytes, args->search_start,
+        args->empty_cluster, nsecs);
+}
+
+interval:s:5 {
+    printf("{\"action\":\"PeriodicStats\","
+           "\"free_entries\":%lld,\"ts\":%llu}\n",
+        count(@free_set), nsecs);
+}
+
+END {
+    clear(@free_set);
+    printf("# btrfs_free_space_cache.bt ended\n");
+}

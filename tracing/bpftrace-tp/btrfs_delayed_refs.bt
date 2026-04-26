@@ -1,0 +1,136 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_delayed_refs.bt  [tracepoint edition]
+ * --------------------------------------------
+ * Traces Btrfs delayed reference operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsDelayedRefs.tla
+ * Invariant:  RefCountConsistency — no extent freed while refs > 0
+ *
+ * Tracepoints:
+ *   btrfs:add_delayed_tree_ref   — tree block ref added to delayed list
+ *   btrfs:run_delayed_tree_ref   — tree block ref processed (run)
+ *   btrfs:add_delayed_data_ref   — data extent ref added
+ *   btrfs:run_delayed_data_ref   — data extent ref processed
+ *   btrfs:add_delayed_ref_head   — new delayed ref head created
+ *   btrfs:run_delayed_ref_head   — delayed ref head processed
+ *   btrfs:btrfs_reserved_extent_alloc — extent allocated
+ *   btrfs:btrfs_reserved_extent_free  — extent freed
+ *
+ * action field in delayed ref events:
+ *   BTRFS_ADD_DELAYED_REF (1) = increment ref count
+ *   BTRFS_DROP_DELAYED_REF(2) = decrement ref count
+ *   BTRFS_ADD_DELAYED_EXTENT(3) = new extent
+ *   BTRFS_UPDATE_DELAYED_HEAD(4) = update head
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_delayed_refs.bt
+ */
+
+BEGIN {
+    printf("# btrfs_delayed_refs.bt [tracepoint] started\n");
+    /* action constants */
+    @ADD_REF = 1; @DROP_REF = 2; @ADD_EXTENT = 3; @UPDATE_HEAD = 4;
+}
+
+tracepoint:btrfs:add_delayed_tree_ref {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddDelayedTreeRef\","
+           "\"bytenr\":%llu,\"num_bytes\":%llu,\"ref_action\":%d,"
+           "\"parent\":%llu,\"ref_root\":%llu,\"level\":%d,\"seq\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->num_bytes, args->action,
+        args->parent, args->ref_root, args->level, args->seq, nsecs);
+
+    if (args->action == @DROP_REF) {
+        @pending_drops[args->bytenr]++;
+    } else if (args->action == @ADD_REF) {
+        if (@pending_drops[args->bytenr] > 0) {
+            @pending_drops[args->bytenr]--;
+        }
+    }
+}
+
+tracepoint:btrfs:run_delayed_tree_ref {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunDelayedTreeRef\","
+           "\"bytenr\":%llu,\"num_bytes\":%llu,\"ref_action\":%d,"
+           "\"parent\":%llu,\"ref_root\":%llu,\"level\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->num_bytes, args->action,
+        args->parent, args->ref_root, args->level, nsecs);
+}
+
+tracepoint:btrfs:add_delayed_data_ref {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddDelayedDataRef\","
+           "\"bytenr\":%llu,\"num_bytes\":%llu,\"ref_action\":%d,"
+           "\"ref_root\":%llu,\"parent\":%llu,\"owner\":%llu,\"offset\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->num_bytes, args->action,
+        args->ref_root, args->parent, args->owner, args->offset, nsecs);
+}
+
+tracepoint:btrfs:run_delayed_data_ref {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunDelayedDataRef\","
+           "\"bytenr\":%llu,\"num_bytes\":%llu,\"ref_action\":%d,"
+           "\"ref_root\":%llu,\"parent\":%llu,\"owner\":%llu,\"offset\":%llu,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->num_bytes, args->action,
+        args->ref_root, args->parent, args->owner, args->offset, nsecs);
+}
+
+tracepoint:btrfs:add_delayed_ref_head {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddDelayedRefHead\","
+           "\"bytenr\":%llu,\"num_bytes\":%llu,\"ref_action\":%d,"
+           "\"is_data\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->num_bytes, args->action,
+        args->is_data, nsecs);
+}
+
+tracepoint:btrfs:run_delayed_ref_head {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunDelayedRefHead\","
+           "\"bytenr\":%llu,\"num_bytes\":%llu,\"ref_action\":%d,"
+           "\"total_ref_mod\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->bytenr, args->num_bytes, args->action,
+        args->total_ref_mod, nsecs);
+
+    /* If total_ref_mod < 0 and there are still pending adds, that's a violation */
+    if (args->total_ref_mod < 0 && @pending_drops[args->bytenr] > 0) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_RefCountUnderflow\","
+               "\"bytenr\":%llu,\"total_ref_mod\":%d,\"ts\":%llu}\n",
+            tid, args->bytenr, args->total_ref_mod, nsecs);
+    }
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_alloc {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+    @allocated[args->start] = args->len;
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_free {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+
+    /* Detect double-free */
+    if (@allocated[args->start] == 0) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_DoubleFree\","
+               "\"start\":%llu,\"ts\":%llu}\n",
+            tid, args->start, nsecs);
+    }
+    delete(@allocated[args->start]);
+}
+
+interval:s:10 {
+    printf("{\"action\":\"PeriodicStats\",\"pending_drops\":%lld,\"ts\":%llu}\n",
+        count(@pending_drops), nsecs);
+}
+
+END {
+    clear(@pending_drops); clear(@allocated);
+    clear(@ADD_REF); clear(@DROP_REF); clear(@ADD_EXTENT); clear(@UPDATE_HEAD);
+    printf("# btrfs_delayed_refs.bt ended\n");
+}

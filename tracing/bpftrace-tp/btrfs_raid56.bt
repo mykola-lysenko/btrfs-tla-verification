@@ -1,0 +1,96 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_raid56.bt  [tracepoint edition]
+ * ---------------------------------------
+ * Traces Btrfs RAID56 stripe I/O operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsRAID56.tla
+ * Invariant:  NoWriteHole — parity must be consistent after partial stripe write
+ *
+ * Tracepoints:
+ *   btrfs:raid56_write  — RAID56 write bio submitted
+ *   btrfs:raid56_read   — RAID56 read bio submitted
+ *
+ * Fields (btrfs_raid56_bio class):
+ *   full_stripe  — logical address of the full stripe
+ *   physical     — physical address on device
+ *   devid        — device ID
+ *   offset       — offset within stripe
+ *   len          — length of this bio
+ *   opf          — bio operation flags (REQ_OP_WRITE=1, REQ_OP_READ=0)
+ *   total_stripes — total number of stripes in this RAID set
+ *   real_stripes  — number of data stripes (total - parity)
+ *   nr_data       — number of data stripes
+ *   stripe_nr     — which stripe this bio targets
+ *
+ * Write hole detection:
+ *   A write hole occurs when a partial stripe write (len < stripe_size)
+ *   is submitted without a corresponding parity update. We detect this
+ *   by tracking partial writes (offset > 0 or len < full stripe size)
+ *   and checking that a parity stripe write follows within the same
+ *   full_stripe address.
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_raid56.bt
+ */
+
+BEGIN {
+    printf("# btrfs_raid56.bt [tracepoint] started\n");
+}
+
+tracepoint:btrfs:raid56_write {
+    $is_partial = (args->offset > 0 || args->len < 65536) ? 1 : 0;
+    $is_parity  = (args->stripe_nr >= args->nr_data) ? 1 : 0;
+
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RAID56_Write\","
+           "\"full_stripe\":%llu,\"physical\":%llu,\"devid\":%llu,"
+           "\"offset\":%u,\"len\":%u,\"stripe_nr\":%u,\"nr_data\":%u,"
+           "\"total_stripes\":%u,\"is_partial\":%d,\"is_parity\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->full_stripe, args->physical, args->devid,
+        args->offset, args->len, args->stripe_nr, args->nr_data,
+        args->total_stripes, $is_partial, $is_parity, nsecs);
+
+    if ($is_partial && !$is_parity) {
+        /* Track partial data write — parity update must follow */
+        @partial_writes[args->full_stripe] = nsecs;
+        @partial_write_count++;
+    }
+
+    if ($is_parity && @partial_writes[args->full_stripe] != 0) {
+        /* Parity write follows partial data write — correct RMW cycle */
+        delete(@partial_writes[args->full_stripe]);
+    }
+}
+
+tracepoint:btrfs:raid56_read {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RAID56_Read\","
+           "\"full_stripe\":%llu,\"physical\":%llu,\"devid\":%llu,"
+           "\"offset\":%u,\"len\":%u,\"stripe_nr\":%u,\"ts\":%llu}\n",
+        tid, comm,
+        args->full_stripe, args->physical, args->devid,
+        args->offset, args->len, args->stripe_nr, nsecs);
+}
+
+/*
+ * Periodic check: partial writes without parity updates older than 1s
+ * indicate a potential write hole (parity update was lost or delayed).
+ */
+interval:s:1 {
+    $now = nsecs;
+    printf("{\"action\":\"PeriodicStats\","
+           "\"partial_writes_pending\":%lld,\"total_partial\":%lld,\"ts\":%llu}\n",
+        count(@partial_writes), @partial_write_count, nsecs);
+}
+
+END {
+    $pending = count(@partial_writes);
+    if ($pending > 0) {
+        printf("{\"action\":\"VIOLATION_WriteHolePending\","
+               "\"pending_partial_writes\":%lld,\"ts\":%llu}\n",
+            $pending, nsecs);
+    }
+    clear(@partial_writes); clear(@partial_write_count);
+    printf("# btrfs_raid56.bt ended\n");
+}

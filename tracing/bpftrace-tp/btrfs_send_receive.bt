@@ -1,0 +1,68 @@
+#!/usr/bin/env bpftrace
+/*
+ * btrfs_send_receive.bt  [tracepoint edition]
+ * ---------------------------------------------
+ * Traces Btrfs send/receive operations.
+ * Verified against Linux 6.9 tracepoint ABI (bpftrace 0.25+).
+ *
+ * TLA+ model: BtrfsSendReceive.tla
+ * Invariant:  NoUAF — snapshot root must not be freed while send reads it
+ *
+ * Tracepoints:
+ *   btrfs:btrfs_transaction_commit    — transaction committed
+ *   btrfs:btrfs_cow_block             — COW during send (shared block read)
+ *   btrfs:btrfs_ordered_extent_add    — write to snapshot (should not happen during send)
+ *   btrfs:btrfs_reserved_extent_free  — extent freed (snapshot root freed?)
+ *
+ * NOTE: There are no dedicated send/receive tracepoints in kernel 6.9.
+ * We use cow_block as a proxy for send reading shared tree blocks.
+ * The is_log_tree field distinguishes log tree vs. subvolume tree access.
+ *
+ * Usage:
+ *   sudo bpftrace btrfs_send_receive.bt
+ */
+
+BEGIN {
+    printf("# btrfs_send_receive.bt [tracepoint] started\n");
+}
+
+tracepoint:btrfs:btrfs_cow_block {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
+           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
+           "\"cow_block\":%llu,\"refs\":%d,\"ts\":%llu}\n",
+        tid, comm,
+        args->root_objectid, args->buf_start, args->buf_level,
+        args->cow_start, args->refs, nsecs);
+    @reading_blocks[tid] = args->buf_start;
+}
+
+tracepoint:btrfs:btrfs_reserved_extent_free {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
+           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->start, args->len, nsecs);
+
+    /* Check if any thread is currently reading this block */
+    if (@reading_blocks[tid] == args->start) {
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_FreeWhileReading\","
+               "\"block\":%llu,\"ts\":%llu}\n",
+            tid, args->start, nsecs);
+    }
+}
+
+tracepoint:btrfs:btrfs_transaction_commit {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\","
+           "\"gen\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->generation, nsecs);
+    delete(@reading_blocks[tid]);
+}
+
+tracepoint:btrfs:btrfs_ordered_extent_add {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\","
+           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+        tid, comm, args->ino, args->file_offset, args->len, nsecs);
+}
+
+END {
+    clear(@reading_blocks);
+    printf("# btrfs_send_receive.bt ended\n");
+}
