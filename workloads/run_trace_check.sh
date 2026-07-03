@@ -4,8 +4,9 @@
 # Harness: run a workload + bpftrace script + invariant checker together.
 #
 # This script:
-#   1. Starts the bpftrace script in the background (writes JSON to a FIFO)
-#   2. Starts the invariant checker in the background (reads from FIFO)
+#   1. Starts the bpftrace script in the background (writes JSON to /tmp)
+#   2. After the run, time-sorts the trace and runs the invariant checker
+#      on it post-hoc (inline checking cannot keep up with event rates)
 #   3. Runs the workload in the foreground
 #   4. Stops bpftrace and waits for the checker to finish
 #   5. Reports the conformance result
@@ -43,7 +44,9 @@ DURATION="${3:-60}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-BPFTRACE_DIR="$REPO_DIR/tracing/bpftrace"
+# BPFTRACE_DIR can be overridden, e.g. to use the tracepoint-based edition:
+#   BPFTRACE_DIR=$REPO_DIR/tracing/bpftrace-tp
+BPFTRACE_DIR="${BPFTRACE_DIR:-$REPO_DIR/tracing/bpftrace}"
 CHECKER_DIR="$REPO_DIR/tracing/checkers"
 WORKLOAD_DIR="$SCRIPT_DIR/$SUBSYSTEM"
 
@@ -110,7 +113,6 @@ OUT_DIR="$SCRIPT_DIR/results/${SUBSYSTEM}_${TIMESTAMP}"
 mkdir -p "$OUT_DIR"
 TRACE_FILE="$OUT_DIR/trace.jsonl"
 REPORT_FILE="$OUT_DIR/report.txt"
-FIFO="$OUT_DIR/trace.fifo"
 
 echo "============================================================"
 echo " Btrfs Trace Conformance Check"
@@ -122,32 +124,40 @@ echo " Trace     : $TRACE_FILE"
 echo " Report    : $REPORT_FILE"
 echo "============================================================"
 
-# Create FIFO for streaming trace to checker
-mkfifo "$FIFO"
-
 # -----------------------------------------------------------------------
-# Start bpftrace — writes JSON events to FIFO and trace file
+# Start bpftrace — writes JSON events to a local temp file
 # -----------------------------------------------------------------------
 echo "[harness] Starting bpftrace: ${BT_SCRIPT[$SUBSYSTEM]}"
-bpftrace "$BT_FILE" | tee "$TRACE_FILE" > "$FIFO" &
+# The checker deliberately runs POST-HOC on the saved trace, not inline on
+# a FIFO: a Python checker parses ~50k JSON lines/s while lock-heavy probes
+# emit >100k events/s — inline checking backpressures bpftrace's stdout and
+# silently drops events, corrupting the very state the checker tracks.
+#
+# -B line: bpftrace fully buffers stdout when piped; line-buffer it so
+# nothing is lost when we stop it.
+# Large perf ring buffer: high-frequency probes (tree locks) overflow the
+# default 64 pages/cpu and drop events. stderr goes to bpftrace.log
+# ("Lost N events" warnings, attach errors).
+# The live trace is written to tmpfs (/dev/shm) first: when the results dir
+# — or even /tmp — is on a slow filesystem (9p share under QEMU: ~12 MB/s),
+# writing the JSON firehose there stalls bpftrace's output pipe and drops
+# millions of events. /dev/shm is guaranteed RAM-backed.
+export BPFTRACE_PERF_RB_PAGES="${BPFTRACE_PERF_RB_PAGES:-2048}"
+TRACE_TMP_DIR="/dev/shm"
+[[ -d "$TRACE_TMP_DIR" && -w "$TRACE_TMP_DIR" ]] || TRACE_TMP_DIR="/tmp"
+TRACE_TMP="$(mktemp "$TRACE_TMP_DIR/btrfs_trace.XXXXXX.jsonl")"
+bpftrace -B line "$BT_FILE" > "$TRACE_TMP" 2>"$OUT_DIR/bpftrace.log" &
 BT_PID=$!
 
-# Give bpftrace time to attach probes
-sleep 2
-
-# -----------------------------------------------------------------------
-# Start checker — reads from FIFO
-# -----------------------------------------------------------------------
-CHECKER_FILE="${CHECKER[$SUBSYSTEM]+x}"
-if [[ -n "${CHECKER[$SUBSYSTEM]+x}" ]] && [[ -f "$CHECKER_DIR/${CHECKER[$SUBSYSTEM]}" ]]; then
-    echo "[harness] Starting checker: ${CHECKER[$SUBSYSTEM]}"
-    python3 "$CHECKER_DIR/${CHECKER[$SUBSYSTEM]}" < "$FIFO" > "$REPORT_FILE" 2>&1 &
-    CHECKER_PID=$!
-else
-    echo "[harness] No Python checker for $SUBSYSTEM — inline VIOLATION_ events will appear in trace."
-    # Drain FIFO so bpftrace doesn't block
-    cat "$FIFO" > /dev/null &
-    CHECKER_PID=$!
+# Wait for bpftrace to attach (BEGIN block writes a "# ... started" banner).
+# On debug kernels (lockdep, BTF) startup can take ~10s; don't start the
+# workload before probes are live or early events are silently missed.
+for _ in $(seq 1 60); do
+    [[ -s "$TRACE_TMP" ]] && break
+    sleep 1
+done
+if [[ ! -s "$TRACE_TMP" ]]; then
+    echo "[harness] WARNING: bpftrace produced no output after 60s — probes may not be attached"
 fi
 
 # -----------------------------------------------------------------------
@@ -163,16 +173,46 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# Stop bpftrace and wait for checker
+# Stop bpftrace, then run the checker post-hoc on the saved trace
 # -----------------------------------------------------------------------
 echo "[harness] Workload complete. Stopping bpftrace..."
+# SIGINT lets bpftrace detach probes, run its END block, and flush.
+kill -INT "$BT_PID" 2>/dev/null || true
+for _ in $(seq 1 15); do
+    kill -0 "$BT_PID" 2>/dev/null || break
+    sleep 1
+done
 kill "$BT_PID" 2>/dev/null || true
 wait "$BT_PID" 2>/dev/null || true
 
-# Close FIFO so checker sees EOF
-exec 3>"$FIFO" && exec 3>&-  # open and immediately close write end
-wait "$CHECKER_PID" 2>/dev/null || true
-CHECKER_EXIT=$?
+# Sort by timestamp: bpftrace merges per-CPU perf buffers in poll order,
+# so cross-CPU events can appear out of order, which breaks stateful
+# checkers (a Release can appear before its Acquire).
+python3 - "$TRACE_TMP" <<'PYSORT' || true
+import json, sys
+path = sys.argv[1]
+lines = open(path, errors="replace").readlines()
+def key(line):
+    try:
+        return json.loads(line).get("ts", 0)
+    except Exception:
+        return 0
+lines.sort(key=key)
+open(path, "w").writelines(lines)
+PYSORT
+
+CHECKER_EXIT=0
+if [[ -n "${CHECKER[$SUBSYSTEM]+x}" ]] && [[ -f "$CHECKER_DIR/${CHECKER[$SUBSYSTEM]}" ]]; then
+    echo "[harness] Running checker: ${CHECKER[$SUBSYSTEM]}"
+    python3 "$CHECKER_DIR/${CHECKER[$SUBSYSTEM]}" < "$TRACE_TMP" > "$REPORT_FILE" 2>&1 \
+        || CHECKER_EXIT=$?
+else
+    echo "[harness] No Python checker for $SUBSYSTEM — inline VIOLATION_ events will appear in trace."
+fi
+
+# Move the trace from tmpfs to the results dir (mktemp files are 0600)
+cp "$TRACE_TMP" "$TRACE_FILE" && rm -f "$TRACE_TMP"
+chmod 644 "$TRACE_FILE" "$REPORT_FILE" "$OUT_DIR/bpftrace.log" 2>/dev/null || true
 
 # -----------------------------------------------------------------------
 # Report
@@ -181,7 +221,7 @@ echo ""
 echo "============================================================"
 echo " Results for: $SUBSYSTEM"
 echo "============================================================"
-VIOLATION_COUNT=$(grep -c "VIOLATION" "$TRACE_FILE" 2>/dev/null || echo 0)
+VIOLATION_COUNT=$(grep -c "VIOLATION" "$TRACE_FILE" 2>/dev/null) || VIOLATION_COUNT=0
 echo " Trace events  : $(wc -l < "$TRACE_FILE") lines"
 echo " Violations    : $VIOLATION_COUNT inline VIOLATION_ events"
 
