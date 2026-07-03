@@ -9,3 +9,7 @@ __pycache__/
 *.jsonl
 *.log
 .DS_Store
+# Per-run trace output (written by workloads/run_trace_check.sh)
+workloads/results/
+# Static bpftrace binary (if fetched for the docker image)
+qemu/bpftrace-static
