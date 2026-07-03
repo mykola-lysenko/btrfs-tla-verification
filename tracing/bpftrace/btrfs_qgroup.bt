@@ -88,6 +88,21 @@ kretprobe:qgroup_rescan_zero_tracking {
     if (@rescan_count > 0) { @rescan_count = @rescan_count - 1; }
 }
 
+/*
+ * The rescan worker is the process that clears qgroup_rescan_running and
+ * signals qgroup_rescan_completion — without these events the trace has an
+ * invisible actor. btrfs_qgroup_rescan_worker is static but is used as a
+ * work-queue function pointer (btrfs_init_work), so it is never inlined.
+ */
+kprobe:btrfs_qgroup_rescan_worker {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanWorker_Enter\"}\n",
+        nsecs, tid, comm);
+}
+kretprobe:btrfs_qgroup_rescan_worker {
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanWorker_Done\"}\n",
+        nsecs, tid, comm);
+}
+
 kprobe:btrfs_qgroup_wait_for_completion {
     printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitRescanCompletion_Enter\"}\n",
         nsecs, tid, comm);

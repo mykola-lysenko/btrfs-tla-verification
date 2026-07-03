@@ -27,4 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends virtme-ng \
     || pip3 install --break-system-packages \
          "git+https://github.com/arighi/virtme-ng.git"
 
+# Java for TLC (TLA+ model checking / trace validation; no JRE on the host)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        default-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /work
