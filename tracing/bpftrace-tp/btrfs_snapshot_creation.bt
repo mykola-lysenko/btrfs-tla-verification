@@ -30,8 +30,7 @@ BEGIN {
 }
 
 tracepoint:btrfs:btrfs_ordered_extent_add {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->file_offset, args->len, args->flags, nsecs);
     @oe_count++;
@@ -39,8 +38,7 @@ tracepoint:btrfs:btrfs_ordered_extent_add {
 }
 
 tracepoint:btrfs:btrfs_ordered_extent_remove {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Remove\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Remove\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->file_offset, args->len, nsecs);
     if (@oe_count > 0) { @oe_count--; }
@@ -48,36 +46,30 @@ tracepoint:btrfs:btrfs_ordered_extent_remove {
 }
 
 tracepoint:btrfs:btrfs_transaction_commit {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\","
-           "\"gen\":%llu,\"oe_in_flight\":%lld,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\",\"gen\":%llu,\"oe_in_flight\":%lld,\"ts\":%llu}\n",
         tid, comm, args->generation, @oe_count, nsecs);
 
     /* Consistency check: ordered extents in flight during commit */
     if (@oe_count > 0) {
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_SnapshotInconsistent\","
-               "\"oe_in_flight\":%lld,\"gen\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_SnapshotInconsistent\",\"oe_in_flight\":%lld,\"gen\":%llu,\"ts\":%llu}\n",
             tid, @oe_count, args->generation, nsecs);
     }
 }
 
 tracepoint:btrfs:btrfs_cow_block {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
-           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
-           "\"cow_block\":%llu,\"refs\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\",\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,\"cow_block\":%llu,\"refs\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->root_objectid, args->buf_start, args->buf_level,
         args->cow_start, args->refs, nsecs);
 }
 
 tracepoint:btrfs:btrfs_sync_fs {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFs\","
-           "\"wait\":%d,\"oe_in_flight\":%lld,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFs\",\"wait\":%d,\"oe_in_flight\":%lld,\"ts\":%llu}\n",
         tid, comm, args->wait, @oe_count, nsecs);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"oe_in_flight\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"oe_in_flight\":%lld,\"ts\":%llu}\n",
         @oe_count, nsecs);
 }
 

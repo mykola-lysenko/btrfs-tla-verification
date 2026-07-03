@@ -41,8 +41,7 @@ BEGIN {
 }
 
 tracepoint:btrfs:btrfs_space_reservation {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SpaceReservation\","
-           "\"type\":\"%s\",\"val\":%llu,\"bytes\":%llu,\"reserve\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SpaceReservation\",\"type\":\"%s\",\"val\":%llu,\"bytes\":%llu,\"reserve\":%d,\"ts\":%llu}\n",
         tid, comm,
         str(args->type), args->val, args->bytes, args->reserve, nsecs);
 
@@ -56,18 +55,16 @@ tracepoint:btrfs:btrfs_space_reservation {
 }
 
 tracepoint:btrfs:btrfs_trigger_flush {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TriggerFlush\","
-           "\"flags\":%llu,\"bytes\":%llu,\"flush\":%d,\"reason\":\"%s\",\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TriggerFlush\",\"flags\":%llu,\"bytes\":%llu,\"flush\":%d,\"reason\":\"%s\",\"ts\":%llu}\n",
         tid, comm,
         args->flags, args->bytes, args->flush, str(args->reason), nsecs);
     @flush_count++;
 }
 
 tracepoint:btrfs:btrfs_flush_space {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FlushSpace\","
-           "\"flags\":%llu,\"num_bytes\":%llu,\"flush\":%d,\"ret\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FlushSpace\",\"flags\":%llu,\"num_bytes\":%llu,\"state\":%d,\"ret\":%d,\"ts\":%llu}\n",
         tid, comm,
-        args->flags, args->num_bytes, args->flush, args->ret, nsecs);
+        args->flags, args->num_bytes, args->state, args->ret, nsecs);
 
     if (args->ret != 0) {
         @flush_errors++;
@@ -81,42 +78,35 @@ tracepoint:btrfs:btrfs_flush_space {
  */
 tracepoint:btrfs:btrfs_reserve_ticket {
     $wait_ns = nsecs - args->start_ns;
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveTicket\","
-           "\"flags\":%llu,\"bytes\":%llu,\"wait_ns\":%llu,\"flush\":%d,\"error\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveTicket\",\"flags\":%llu,\"bytes\":%llu,\"wait_ns\":%llu,\"flush\":%d,\"error\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->flags, args->bytes, $wait_ns, args->flush, args->error, nsecs);
 
     if (args->error != 0) {
         @enospc_count++;
-        printf("{\"tid\":%d,\"action\":\"ReserveTicket_ENOSPC\","
-               "\"bytes\":%llu,\"wait_ns\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"ReserveTicket_ENOSPC\",\"bytes\":%llu,\"wait_ns\":%llu,\"ts\":%llu}\n",
             tid, args->bytes, $wait_ns, nsecs);
     }
 
     /* Starvation: waited > 5 seconds and still got space */
     if ($wait_ns > 5000000000 && args->error == 0) {
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_Starvation\","
-               "\"bytes\":%llu,\"wait_ns\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_Starvation\",\"bytes\":%llu,\"wait_ns\":%llu,\"ts\":%llu}\n",
             tid, args->bytes, $wait_ns, nsecs);
     }
 }
 
 tracepoint:btrfs:update_bytes_may_use {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UpdateBytesMayUse\","
-           "\"sinfo_flags\":%llu,\"delta\":%lld,\"ts\":%llu}\n",
-        tid, comm, args->sinfo_flags, args->delta, nsecs);
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UpdateBytesMayUse\",\"type\":%llu,\"diff\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->type, args->diff, nsecs);
 }
 
 tracepoint:btrfs:update_bytes_pinned {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UpdateBytesPinned\","
-           "\"sinfo_flags\":%llu,\"delta\":%lld,\"ts\":%llu}\n",
-        tid, comm, args->sinfo_flags, args->delta, nsecs);
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UpdateBytesPinned\",\"type\":%llu,\"diff\":%lld,\"ts\":%llu}\n",
+        tid, comm, args->type, args->diff, nsecs);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"total_reserved\":%lld,\"flush_count\":%lld,"
-           "\"flush_errors\":%lld,\"enospc_count\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"total_reserved\":%lld,\"flush_count\":%lld,\"flush_errors\":%lld,\"enospc_count\":%lld,\"ts\":%llu}\n",
         @total_reserved, @flush_count, @flush_errors, @enospc_count, nsecs);
 }
 

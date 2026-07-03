@@ -33,10 +33,14 @@ class ExtentBufferLockChecker(BtrfsChecker):
             name="BtrfsExtentBufferLock",
             invariant="NoDeadlock (top-down lock ordering)",
         )
-        # held_levels[tid] = set of levels currently held by that thread
-        self.held_levels: dict[int, set] = {}
-        # waiting_for[tid] = level the thread is trying to acquire
-        self.waiting_for: dict[int, int] = {}
+        # held[tid] = {bytenr: level} for locks currently held by that
+        # thread. Keyed by bytenr so a Release always removes its entry even
+        # when the tracer could not read the level (-1) for one of the two
+        # events — level-keyed tracking left stale entries behind and
+        # produced false "inversion" reports.
+        self.held: dict[int, dict[int, int]] = {}
+        # waiting_for[tid] = (bytenr, level) the thread is trying to acquire
+        self.waiting_for: dict[int, tuple] = {}
 
     def process_event(self, event: TraceEvent) -> None:
         tid = event.tid
@@ -44,52 +48,88 @@ class ExtentBufferLockChecker(BtrfsChecker):
 
         if action == "AcquireWrite":
             level = event.raw.get("level", -1)
-            held = self.held_levels.get(tid, set())
+            bytenr = event.raw.get("bytenr", -1)
+            owner = event.raw.get("owner", 0)
+            # The tracer reads level/owner from the on-disk header at lock
+            # ENTRY, but a freshly allocated buffer is locked BEFORE its
+            # header is written — the read races and returns garbage
+            # (observed: "level 122"). BTRFS_MAX_LEVEL is 8, so anything
+            # >= 8 is a racy read; recycled page content can also yield a
+            # plausible-but-wrong small level, which we cannot detect here.
+            if level >= 8:
+                level = -1
+            # Log-tree blocks (owner -6/-7) are exempt from ordering checks:
+            # they are only locked by the per-root log-writer context under
+            # log_mutex, so cross-thread ABBA cannot arise, and the kernel
+            # legitimately locks them bottom-up while building the log.
+            # (Observed: tree-log level-1 acquisitions while holding log
+            # leaves during fsync.) The TLA+ model covers main-tree locking.
+            if owner >= 2**64 - 7:
+                level = -1
+            held = self.held[tid] = self.held.get(tid, {})
+            # Lock ordering is only defined within one btree: locks in
+            # different trees (fs tree vs extent tree vs csum tree...) are
+            # independent domains, so compare levels only for the same owner.
+            known = [l for (l, o) in held.values() if l >= 0 and o == owner]
 
-            # Check: is the thread trying to acquire a level HIGHER than
-            # any level it currently holds? That would be bottom-up = violation.
-            if held and level > max(held):
-                self.violation(
-                    event,
-                    f"Lock inversion: tid={tid} holds levels {sorted(held)} "
-                    f"but is acquiring level {level} (must go top-down, high→low)",
-                )
+            # Level unknown (tracer could not read the btrfs_header, e.g.
+            # multi-page extent buffer with no contiguous mapping): still
+            # track the lock by bytenr, but skip ordering checks.
+            if level >= 0:
+                # Check: is the thread trying to acquire a level HIGHER than
+                # any level it currently holds? Bottom-up = violation.
+                if known and level > max(known):
+                    self.violation(
+                        event,
+                        f"Lock inversion: tid={tid} holds levels {sorted(known)} "
+                        f"but is acquiring level {level} (must go top-down, high→low)",
+                    )
 
-            # Check for potential deadlock: another thread holds this level
-            for other_tid, other_held in self.held_levels.items():
+            # ABBA deadlock: another thread HOLDS the exact lock (bytenr)
+            # we want, while WAITING for a lock we hold. (The TLA+ model
+            # had one lock per level, so it compared levels; on a real
+            # kernel lock identity is the extent buffer bytenr.)
+            for other_tid, other_held in self.held.items():
                 if other_tid == tid:
                     continue
-                if level in other_held:
-                    # Other thread holds the level we want
+                if bytenr in other_held:
                     other_waiting = self.waiting_for.get(other_tid)
-                    if other_waiting is not None and other_waiting in held:
+                    if other_waiting is not None and other_waiting[0] in held:
                         self.violation(
                             event,
-                            f"Deadlock detected: tid={tid} wants level {level} "
-                            f"(held by tid={other_tid}), and tid={other_tid} "
-                            f"wants level {other_waiting} (held by tid={tid})",
+                            f"Deadlock detected: tid={tid} wants bytenr {bytenr} "
+                            f"level {level} (held by tid={other_tid}), and "
+                            f"tid={other_tid} waits for bytenr {other_waiting[0]} "
+                            f"(held by tid={tid})",
                         )
 
-            self.waiting_for[tid] = level
+            self.waiting_for[tid] = (bytenr, level, owner)
 
         elif action == "AcquireWrite_Done":
-            level = self.waiting_for.pop(tid, None)
-            if level is not None:
-                self.held_levels.setdefault(tid, set()).add(level)
+            pending = self.waiting_for.pop(tid, None)
+            if pending is not None:
+                bytenr, level, owner = pending
+                self.held.setdefault(tid, {})[bytenr] = (level, owner)
 
         elif action == "Release":
-            level = event.raw.get("level", -1)
-            self.held_levels.get(tid, set()).discard(level)
-            if not self.held_levels.get(tid):
-                self.held_levels.pop(tid, None)
+            bytenr = event.raw.get("bytenr", -1)
+            held = self.held.get(tid)
+            if held is not None:
+                held.pop(bytenr, None)
+                if not held:
+                    self.held.pop(tid, None)
 
         elif action == "AcquireRead":
             level = event.raw.get("level", -1)
-            held = self.held_levels.get(tid, set())
-            if held and level > max(held):
+            owner = event.raw.get("owner", 0)
+            if level < 0 or level >= 8 or owner >= 2**64 - 7:
+                return
+            known = [l for (l, o) in self.held.get(tid, {}).values()
+                     if l >= 0 and o == owner]
+            if known and level > max(known):
                 self.violation(
                     event,
-                    f"Read lock inversion: tid={tid} holds levels {sorted(held)} "
+                    f"Read lock inversion: tid={tid} holds levels {sorted(known)} "
                     f"but is acquiring read lock at level {level}",
                 )
 

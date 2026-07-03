@@ -43,10 +43,7 @@ tracepoint:btrfs:raid56_write {
     $is_partial = (args->offset > 0 || args->len < 65536) ? 1 : 0;
     $is_parity  = (args->stripe_nr >= args->nr_data) ? 1 : 0;
 
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RAID56_Write\","
-           "\"full_stripe\":%llu,\"physical\":%llu,\"devid\":%llu,"
-           "\"offset\":%u,\"len\":%u,\"stripe_nr\":%u,\"nr_data\":%u,"
-           "\"total_stripes\":%u,\"is_partial\":%d,\"is_parity\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RAID56_Write\",\"full_stripe\":%llu,\"physical\":%llu,\"devid\":%llu,\"offset\":%u,\"len\":%u,\"stripe_nr\":%u,\"nr_data\":%u,\"total_stripes\":%u,\"is_partial\":%d,\"is_parity\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->full_stripe, args->physical, args->devid,
         args->offset, args->len, args->stripe_nr, args->nr_data,
@@ -65,9 +62,7 @@ tracepoint:btrfs:raid56_write {
 }
 
 tracepoint:btrfs:raid56_read {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RAID56_Read\","
-           "\"full_stripe\":%llu,\"physical\":%llu,\"devid\":%llu,"
-           "\"offset\":%u,\"len\":%u,\"stripe_nr\":%u,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RAID56_Read\",\"full_stripe\":%llu,\"physical\":%llu,\"devid\":%llu,\"offset\":%u,\"len\":%u,\"stripe_nr\":%u,\"ts\":%llu}\n",
         tid, comm,
         args->full_stripe, args->physical, args->devid,
         args->offset, args->len, args->stripe_nr, nsecs);
@@ -79,16 +74,14 @@ tracepoint:btrfs:raid56_read {
  */
 interval:s:1 {
     $now = nsecs;
-    printf("{\"action\":\"PeriodicStats\","
-           "\"partial_writes_pending\":%lld,\"total_partial\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"partial_writes_pending\":%lld,\"total_partial\":%lld,\"ts\":%llu}\n",
         count(@partial_writes), @partial_write_count, nsecs);
 }
 
 END {
     $pending = count(@partial_writes);
     if ($pending > 0) {
-        printf("{\"action\":\"VIOLATION_WriteHolePending\","
-               "\"pending_partial_writes\":%lld,\"ts\":%llu}\n",
+        printf("{\"action\":\"VIOLATION_WriteHolePending\",\"pending_partial_writes\":%lld,\"ts\":%llu}\n",
             $pending, nsecs);
     }
     clear(@partial_writes); clear(@partial_write_count);

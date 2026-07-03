@@ -31,9 +31,7 @@ BEGIN {
 
 /* COW block: thread T is traversing buf_start */
 tracepoint:btrfs:btrfs_cow_block {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
-           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
-           "\"cow_block\":%llu,\"cow_level\":%d,\"refs\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\",\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,\"cow_block\":%llu,\"cow_level\":%d,\"refs\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->root_objectid, args->buf_start, args->buf_level,
         args->cow_start, args->cow_level, args->refs, nsecs);
@@ -52,8 +50,7 @@ tracepoint:btrfs:btrfs_cow_block {
 /* Delayed tree ref added — a DROP_REF schedules a future free */
 tracepoint:btrfs:add_delayed_tree_ref {
     if (args->action == @DROP_REF) {
-        printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddDelayedDrop\","
-               "\"bytenr\":%llu,\"level\":%d,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AddDelayedDrop\",\"bytenr\":%llu,\"level\":%d,\"ts\":%llu}\n",
             tid, comm, args->bytenr, args->level, nsecs);
         @pending_free[args->bytenr] = tid;
     }
@@ -62,8 +59,7 @@ tracepoint:btrfs:add_delayed_tree_ref {
 /* Delayed tree ref executed — the actual free happens here */
 tracepoint:btrfs:run_delayed_tree_ref {
     if (args->action == @DROP_REF) {
-        printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunDelayedDrop\","
-               "\"bytenr\":%llu,\"level\":%d,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RunDelayedDrop\",\"bytenr\":%llu,\"level\":%d,\"ts\":%llu}\n",
             tid, comm, args->bytenr, args->level, nsecs);
 
         /*
@@ -79,14 +75,12 @@ tracepoint:btrfs:run_delayed_tree_ref {
 
 /* Extent freed — the block is now invalid */
 tracepoint:btrfs:btrfs_reserved_extent_free {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
 
     /* If this block was being COWed by this thread, that's a UAF */
     if (@cow_active[tid] == args->start) {
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_UAF_SameThread\","
-               "\"block\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_UAF_SameThread\",\"block\":%llu,\"ts\":%llu}\n",
             tid, args->start, nsecs);
     }
     delete(@cow_active[tid]);
@@ -95,14 +89,12 @@ tracepoint:btrfs:btrfs_reserved_extent_free {
 }
 
 tracepoint:btrfs:btrfs_reserved_extent_alloc {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"active_cows\":%lld,\"pending_frees\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"active_cows\":%lld,\"pending_frees\":%lld,\"ts\":%llu}\n",
         count(@cow_active), count(@pending_free), nsecs);
 }
 

@@ -16,12 +16,23 @@ the recommended approach for any system where kprobes fail to load.
 
 ## Verified Environment
 
-These scripts were verified against the Linux 6.9 tracepoint ABI
-(`include/trace/events/btrfs.h`). They are compatible with:
+These scripts are verified to parse, attach, and emit events against the
+btrfs `for-next` development tree (7.1.0-rc7) under QEMU/KVM with
+**bpftrace 0.25** (see `qemu/README.md` for the harness). Two classes of
+fixes were required to get there — the original scripts had never run:
 
-- Linux 6.1 LTS through 6.14+
-- bpftrace 0.14+
-- No `CONFIG_DEBUG_INFO_BTF` required (though BTF helps with error messages)
+- **bpftrace has no C-style adjacent string literal concatenation** (in any
+  version). All multi-line `printf` format strings were joined into single
+  literals (`tracing/join_bt_strings.py` automates this).
+- **Tracepoint names are NOT a stable ABI.** Upstream renamed several between
+  6.9 and 7.1: `qgroup_*` → `btrfs_qgroup_*`, `find_free_extent*` →
+  `btrfs_find_free_extent*`, `btrfs_sync_file` → `btrfs_sync_file_enter`.
+  The list of tracepoints present in the verified kernel is in
+  `qemu/tracepoints-guest.txt`; re-audit against `bpftrace -l
+  'tracepoint:btrfs:*'` when moving to another kernel.
+
+Requirements: bpftrace ≥ 0.21 recommended; no `CONFIG_DEBUG_INFO_BTF`
+required for the tracepoint scripts (BTF helps with error messages).
 
 ## Quick Start
 

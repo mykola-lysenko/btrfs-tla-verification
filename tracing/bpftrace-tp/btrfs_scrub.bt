@@ -29,37 +29,31 @@ BEGIN {
 }
 
 tracepoint:btrfs:btrfs_reserved_extent_alloc {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
     @alloc_pending[args->start] = nsecs;
 }
 
 tracepoint:btrfs:btrfs_reserved_extent_free {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
     delete(@alloc_pending[args->start]);
 }
 
 tracepoint:btrfs:btrfs_cow_block {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
-           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
-           "\"cow_block\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\",\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,\"cow_block\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->root_objectid, args->buf_start, args->buf_level,
         args->cow_start, nsecs);
 }
 
 tracepoint:btrfs:btrfs_transaction_commit {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\","
-           "\"gen\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\",\"gen\":%llu,\"ts\":%llu}\n",
         tid, comm, args->generation, nsecs);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"pending_allocs\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"pending_allocs\":%lld,\"ts\":%llu}\n",
         count(@alloc_pending), nsecs);
 }
 

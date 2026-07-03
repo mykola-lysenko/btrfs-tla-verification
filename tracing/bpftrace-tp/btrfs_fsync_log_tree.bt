@@ -32,9 +32,8 @@ BEGIN {
 }
 
 /* fsync() called — this is Thread A (the logger) */
-tracepoint:btrfs:btrfs_sync_file {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FsyncFile\","
-           "\"ino\":%llu,\"parent\":%llu,\"root\":%llu,\"datasync\":%d,\"ts\":%llu}\n",
+tracepoint:btrfs:btrfs_sync_file_enter {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FsyncFile\",\"ino\":%llu,\"parent\":%llu,\"root\":%llu,\"datasync\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->parent, args->root_objectid, args->datasync, nsecs);
     @fsync_active[tid] = args->ino;
@@ -43,9 +42,7 @@ tracepoint:btrfs:btrfs_sync_file {
 
 /* Ordered extent added — this is Thread B (the writer extending i_size) */
 tracepoint:btrfs:btrfs_ordered_extent_add {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,"
-           "\"compress\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,\"compress\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->file_offset, args->len, args->flags,
         args->compress_type, nsecs);
@@ -58,8 +55,7 @@ tracepoint:btrfs:btrfs_ordered_extent_add {
 
 /* Ordered extent looked up for logging — this is the critical point in fsync */
 tracepoint:btrfs:btrfs_ordered_extent_lookup_for_logging {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_LookupForLog\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_LookupForLog\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->file_offset, args->len, nsecs);
 
@@ -72,9 +68,7 @@ tracepoint:btrfs:btrfs_ordered_extent_lookup_for_logging {
         $writer_offset = @oe_offset[args->ino];
         if ($writer_offset <= args->file_offset + args->len &&
             $writer_offset + 4096 >= args->file_offset) {
-            printf("{\"tid\":%d,\"action\":\"VIOLATION_ConcurrentWriteAndLog\","
-                   "\"ino\":%llu,\"log_offset\":%llu,\"write_offset\":%llu,"
-                   "\"writer_tid\":%lld,\"ts\":%llu}\n",
+            printf("{\"tid\":%d,\"action\":\"VIOLATION_ConcurrentWriteAndLog\",\"ino\":%llu,\"log_offset\":%llu,\"write_offset\":%llu,\"writer_tid\":%lld,\"ts\":%llu}\n",
                 tid, args->ino, args->file_offset,
                 $writer_offset, @oe_active[args->ino], nsecs);
         }
@@ -83,8 +77,7 @@ tracepoint:btrfs:btrfs_ordered_extent_lookup_for_logging {
 
 /* Ordered extent finished — clears the active write record */
 tracepoint:btrfs:btrfs_ordered_extent_mark_finished {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Finished\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Finished\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->file_offset, args->len, nsecs);
     delete(@oe_active[args->ino]);
@@ -93,8 +86,7 @@ tracepoint:btrfs:btrfs_ordered_extent_mark_finished {
 
 /* Ordered extent removed (completed and cleaned up) */
 tracepoint:btrfs:btrfs_ordered_extent_remove {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Remove\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Remove\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->file_offset, args->len, nsecs);
     delete(@fsync_active[tid]);
@@ -103,14 +95,12 @@ tracepoint:btrfs:btrfs_ordered_extent_remove {
 
 /* Transaction committed — log tree flushed to disk */
 tracepoint:btrfs:btrfs_transaction_commit {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\","
-           "\"gen\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\",\"gen\":%llu,\"ts\":%llu}\n",
         tid, comm, args->generation, nsecs);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"active_fsyncs\":%lld,\"active_oe\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"active_fsyncs\":%lld,\"active_oe\":%lld,\"ts\":%llu}\n",
         count(@fsync_active), count(@oe_active), nsecs);
 }
 

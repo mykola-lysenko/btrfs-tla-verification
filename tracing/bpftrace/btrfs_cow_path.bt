@@ -57,7 +57,7 @@ kprobe:btrfs_cow_block {
      */
     $buf = (struct extent_buffer *)arg2;
     printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"CowBlock_Enter\",\"bytenr\":%llu,\"level\":%d}\n",
-        nsecs, tid, comm, $buf->start, (uint8)$buf->level);
+        nsecs, tid, comm, $buf->start, $buf->addr != 0 ? (int64)((struct btrfs_header *)$buf->addr)->level : (int64)-1);
 }
 
 kretprobe:btrfs_cow_block {

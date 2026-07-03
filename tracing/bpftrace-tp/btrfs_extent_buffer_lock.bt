@@ -31,8 +31,7 @@ BEGIN {
 
 /* Write lock acquired — fires after the lock is held */
 tracepoint:btrfs:btrfs_tree_lock {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireWrite\","
-           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"wait_ns\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireWrite\",\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"wait_ns\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->block, args->owner, args->is_log_tree, args->diff_ns, nsecs);
     @write_held[tid] = args->block;
@@ -42,8 +41,7 @@ tracepoint:btrfs:btrfs_tree_lock {
 
 /* Read lock acquired — fires after the lock is held */
 tracepoint:btrfs:btrfs_tree_read_lock {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireRead\","
-           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"wait_ns\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireRead\",\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"wait_ns\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->block, args->owner, args->is_log_tree, args->diff_ns, nsecs);
     @read_held[tid] = args->block;
@@ -51,8 +49,7 @@ tracepoint:btrfs:btrfs_tree_read_lock {
 
 /* Write lock released */
 tracepoint:btrfs:btrfs_tree_unlock {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"Release\","
-           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"Release\",\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->block, args->owner, args->is_log_tree, nsecs);
     delete(@write_held[tid]);
@@ -62,8 +59,7 @@ tracepoint:btrfs:btrfs_tree_unlock {
 
 /* Read lock released */
 tracepoint:btrfs:btrfs_tree_read_unlock {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReleaseRead\","
-           "\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReleaseRead\",\"block\":%llu,\"owner\":%llu,\"is_log\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->block, args->owner, args->is_log_tree, nsecs);
     delete(@read_held[tid]);
@@ -76,16 +72,13 @@ tracepoint:btrfs:btrfs_tree_read_unlock {
  * If they differ, that is a structural anomaly.
  */
 tracepoint:btrfs:btrfs_cow_block {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
-           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,"
-           "\"cow_block\":%llu,\"cow_level\":%d,\"refs\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\",\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,\"cow_block\":%llu,\"cow_level\":%d,\"refs\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->root_objectid, args->buf_start, args->buf_level,
         args->cow_start, args->cow_level, args->refs, nsecs);
 
     if (args->buf_level != args->cow_level) {
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_LevelMismatch\","
-               "\"buf_level\":%d,\"cow_level\":%d,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_LevelMismatch\",\"buf_level\":%d,\"cow_level\":%d,\"ts\":%llu}\n",
             tid, args->buf_level, args->cow_level, nsecs);
     }
 }

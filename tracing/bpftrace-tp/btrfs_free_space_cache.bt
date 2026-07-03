@@ -31,78 +31,64 @@ BEGIN {
 }
 
 tracepoint:btrfs:btrfs_reserved_extent_alloc {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
 
     if (@free_set[args->start] == 0) {
         /* Allocated an extent that wasn't in the free set — possible corruption */
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_AllocNotFree\","
-               "\"start\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_AllocNotFree\",\"start\":%llu,\"ts\":%llu}\n",
             tid, args->start, nsecs);
     }
     delete(@free_set[args->start]);
 }
 
 tracepoint:btrfs:btrfs_reserved_extent_free {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
 
     /* Double-add detection */
     if (@free_set[args->start] != 0) {
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_DoubleAdd\","
-               "\"start\":%llu,\"prev_ts\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_DoubleAdd\",\"start\":%llu,\"prev_ts\":%llu,\"ts\":%llu}\n",
             tid, args->start, @free_set[args->start], nsecs);
     }
     @free_set[args->start] = nsecs;
 }
 
-tracepoint:btrfs:find_free_extent {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent\","
-           "\"root\":%llu,\"num_bytes\":%llu,\"empty_size\":%llu,"
-           "\"data\":%llu,\"ts\":%llu}\n",
+tracepoint:btrfs:btrfs_find_free_extent {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent\",\"root\":%llu,\"num_bytes\":%llu,\"empty_size\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
         tid, comm,
         args->root_objectid, args->num_bytes, args->empty_size,
-        args->data, nsecs);
+        args->flags, nsecs);
 }
 
-tracepoint:btrfs:find_free_extent_search_loop {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent_Loop\","
-           "\"root\":%llu,\"loop\":%u,\"ts\":%llu}\n",
+tracepoint:btrfs:btrfs_find_free_extent_search_loop {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent_Loop\",\"root\":%llu,\"loop\":%u,\"ts\":%llu}\n",
         tid, comm, args->root_objectid, args->loop, nsecs);
 }
 
-tracepoint:btrfs:find_free_extent_have_block_group {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent_HaveBG\","
-           "\"root\":%llu,\"flags\":%llu,\"empty_size\":%llu,"
-           "\"min_bytes\":%llu,\"loop\":%u,\"ts\":%llu}\n",
+tracepoint:btrfs:btrfs_find_free_extent_have_block_group {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FindFreeExtent_HaveBG\",\"root\":%llu,\"flags\":%llu,\"empty_size\":%llu,\"num_bytes\":%llu,\"loop\":%u,\"ts\":%llu}\n",
         tid, comm,
         args->root_objectid, args->flags, args->empty_size,
-        args->min_bytes, args->loop, nsecs);
+        args->num_bytes, args->loop, nsecs);
 }
 
 tracepoint:btrfs:btrfs_reserve_extent {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveExtent\","
-           "\"bg_offset\":%llu,\"num_bytes\":%llu,\"search_start\":%llu,"
-           "\"empty_cluster\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveExtent\",\"bg\":%llu,\"len\":%llu,\"start\":%llu,\"loop\":%llu,\"ts\":%llu}\n",
         tid, comm,
-        args->bg_offset, args->num_bytes, args->search_start,
-        args->empty_cluster, nsecs);
+        args->bg_objectid, args->len, args->start,
+        args->loop, nsecs);
 }
 
 tracepoint:btrfs:btrfs_reserve_extent_cluster {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveExtentCluster\","
-           "\"bg_offset\":%llu,\"num_bytes\":%llu,\"search_start\":%llu,"
-           "\"empty_cluster\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReserveExtentCluster\",\"bg\":%llu,\"len\":%llu,\"start\":%llu,\"loop\":%llu,\"ts\":%llu}\n",
         tid, comm,
-        args->bg_offset, args->num_bytes, args->search_start,
-        args->empty_cluster, nsecs);
+        args->bg_objectid, args->len, args->start,
+        args->loop, nsecs);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"free_entries\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"free_entries\":%lld,\"ts\":%llu}\n",
         count(@free_set), nsecs);
 }
 

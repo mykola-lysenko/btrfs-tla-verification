@@ -36,25 +36,22 @@ BEGIN {
 
 /* Transaction committed — marks end of a transaction */
 tracepoint:btrfs:btrfs_transaction_commit {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"CommitTransaction_Done\","
-           "\"gen\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"CommitTransaction_Done\",\"gen\":%llu,\"ts\":%llu}\n",
         tid, comm, args->generation, nsecs);
     @last_commit_ts = nsecs;
     @last_commit_gen = args->generation;
 }
 
 /* fsync called — triggers log tree commit (lighter than full tx commit) */
-tracepoint:btrfs:btrfs_sync_file {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFile\","
-           "\"ino\":%llu,\"root\":%llu,\"datasync\":%d,\"ts\":%llu}\n",
+tracepoint:btrfs:btrfs_sync_file_enter {
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFile\",\"ino\":%llu,\"root\":%llu,\"datasync\":%d,\"ts\":%llu}\n",
         tid, comm, args->ino, args->root_objectid, args->datasync, nsecs);
     @sync_file_ts[tid] = nsecs;
 }
 
 /* sync() called — triggers full transaction commit */
 tracepoint:btrfs:btrfs_sync_fs {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFs\","
-           "\"wait\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SyncFs\",\"wait\":%d,\"ts\":%llu}\n",
         tid, comm, args->wait, nsecs);
     if (args->wait == 1) {
         @commit_start_ts[tid] = nsecs;
@@ -65,8 +62,7 @@ tracepoint:btrfs:btrfs_sync_fs {
  * before a transaction can commit. This is the key ingredient for the
  * CVE-2025-71194 deadlock. */
 tracepoint:btrfs:btrfs_ordered_extent_add {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"flags\":%lu,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->file_offset, args->len, args->flags, nsecs);
     @ordered_count++;
@@ -75,15 +71,13 @@ tracepoint:btrfs:btrfs_ordered_extent_add {
 
 /* Ordered extent I/O started */
 tracepoint:btrfs:btrfs_ordered_extent_start {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Start\","
-           "\"ino\":%llu,\"offset\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Start\",\"ino\":%llu,\"offset\":%llu,\"ts\":%llu}\n",
         tid, comm, args->ino, args->file_offset, nsecs);
 }
 
 /* Ordered extent completed — decrements the in-flight count */
 tracepoint:btrfs:btrfs_finish_ordered_extent {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Finish\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"uptodate\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Finish\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"uptodate\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->ino, args->start, args->len, args->uptodate, nsecs);
     if (@ordered_count > 0) { @ordered_count--; }
@@ -97,8 +91,7 @@ tracepoint:btrfs:btrfs_finish_ordered_extent {
  * A long-running reservation with no subsequent commit = potential deadlock.
  */
 tracepoint:btrfs:btrfs_space_reservation {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SpaceReservation\","
-           "\"type\":\"%s\",\"val\":%llu,\"bytes\":%llu,\"reserve\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"SpaceReservation\",\"type\":\"%s\",\"val\":%llu,\"bytes\":%llu,\"reserve\":%d,\"ts\":%llu}\n",
         tid, comm,
         str(args->type), args->val, args->bytes, args->reserve, nsecs);
 
@@ -113,18 +106,16 @@ tracepoint:btrfs:btrfs_space_reservation {
 
 /* Space flush triggered — indicates the system is under reservation pressure */
 tracepoint:btrfs:btrfs_trigger_flush {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TriggerFlush\","
-           "\"flags\":%llu,\"bytes\":%llu,\"flush\":%d,\"reason\":\"%s\",\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TriggerFlush\",\"flags\":%llu,\"bytes\":%llu,\"flush\":%d,\"reason\":\"%s\",\"ts\":%llu}\n",
         tid, comm,
         args->flags, args->bytes, args->flush, str(args->reason), nsecs);
 }
 
 /* Space flush action */
 tracepoint:btrfs:btrfs_flush_space {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FlushSpace\","
-           "\"flags\":%llu,\"num_bytes\":%llu,\"flush\":%d,\"ret\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"FlushSpace\",\"flags\":%llu,\"num_bytes\":%llu,\"state\":%d,\"ret\":%d,\"ts\":%llu}\n",
         tid, comm,
-        args->flags, args->num_bytes, args->flush, args->ret, nsecs);
+        args->flags, args->num_bytes, args->state, args->ret, nsecs);
 }
 
 /*
@@ -132,9 +123,7 @@ tracepoint:btrfs:btrfs_flush_space {
  * High ordered_count + pending commit = deadlock risk window.
  */
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"ordered_in_flight\":%lld,"
-           "\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"ordered_in_flight\":%lld,\"ts\":%llu}\n",
         @ordered_count, nsecs);
 }
 

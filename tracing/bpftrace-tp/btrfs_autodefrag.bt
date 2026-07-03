@@ -28,49 +28,42 @@ BEGIN {
 }
 
 tracepoint:btrfs:btrfs_inode_new {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"InodeNew\","
-           "\"ino\":%llu,\"root\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"InodeNew\",\"ino\":%llu,\"root\":%llu,\"ts\":%llu}\n",
         tid, comm, args->ino, args->root_objectid, nsecs);
     @live_inodes[args->ino] = args->root_objectid;
 }
 
 tracepoint:btrfs:btrfs_inode_evict {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"InodeEvict\","
-           "\"ino\":%llu,\"root\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"InodeEvict\",\"ino\":%llu,\"root\":%llu,\"ts\":%llu}\n",
         tid, comm, args->ino, args->root_objectid, nsecs);
     delete(@live_inodes[args->ino]);
     @evicted_inodes[args->ino] = nsecs;
 }
 
 tracepoint:btrfs:btrfs_ordered_extent_add {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\","
-           "\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"OrderedExtent_Add\",\"ino\":%llu,\"offset\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->ino, args->file_offset, args->len, nsecs);
 
     /* Defrag on evicted inode */
     if (@evicted_inodes[args->ino] != 0) {
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_DefragEvictedInode\","
-               "\"ino\":%llu,\"evict_ts\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_DefragEvictedInode\",\"ino\":%llu,\"evict_ts\":%llu,\"ts\":%llu}\n",
             tid, args->ino, @evicted_inodes[args->ino], nsecs);
     }
 }
 
 tracepoint:btrfs:btrfs_cow_block {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\","
-           "\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"COWBlock\",\"root\":%llu,\"buf_block\":%llu,\"buf_level\":%d,\"ts\":%llu}\n",
         tid, comm,
         args->root_objectid, args->buf_start, args->buf_level, nsecs);
 }
 
 tracepoint:btrfs:btrfs_transaction_commit {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\","
-           "\"gen\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\",\"gen\":%llu,\"ts\":%llu}\n",
         tid, comm, args->generation, nsecs);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"live_inodes\":%lld,\"evicted_inodes\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"live_inodes\":%lld,\"evicted_inodes\":%lld,\"ts\":%llu}\n",
         count(@live_inodes), count(@evicted_inodes), nsecs);
 }
 

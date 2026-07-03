@@ -29,53 +29,46 @@ BEGIN {
 }
 
 tracepoint:btrfs:btrfs_reserved_extent_alloc {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentAlloc\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
     @allocated[args->start] = args->len;
 }
 
 tracepoint:btrfs:btrfs_reserved_extent_free {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\","
-           "\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"ExtentFree\",\"start\":%llu,\"len\":%llu,\"ts\":%llu}\n",
         tid, comm, args->start, args->len, nsecs);
     delete(@allocated[args->start]);
     @freed[args->start] = nsecs;
 }
 
 tracepoint:btrfs:btrfs_add_unused_block_group {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UnusedBlockGroup\","
-           "\"bytenr\":%llu,\"len\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"UnusedBlockGroup\",\"bytenr\":%llu,\"len\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
         tid, comm, args->bytenr, args->len, args->flags, nsecs);
     @discard_pending[args->bytenr] = args->len;
 }
 
 tracepoint:btrfs:btrfs_remove_block_group {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RemoveBlockGroup\","
-           "\"bytenr\":%llu,\"len\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"RemoveBlockGroup\",\"bytenr\":%llu,\"len\":%llu,\"flags\":%llu,\"ts\":%llu}\n",
         tid, comm, args->bytenr, args->len, args->flags, nsecs);
 
     /* Check if any allocated extent falls within this block group */
     /* (full check done by Python checker; inline check for same-thread) */
     if (@allocated[args->bytenr] != 0) {
-        printf("{\"tid\":%d,\"action\":\"VIOLATION_DiscardLiveExtent\","
-               "\"bg_start\":%llu,\"ts\":%llu}\n",
+        printf("{\"tid\":%d,\"action\":\"VIOLATION_DiscardLiveExtent\",\"bg_start\":%llu,\"ts\":%llu}\n",
             tid, args->bytenr, nsecs);
     }
     delete(@discard_pending[args->bytenr]);
 }
 
 tracepoint:btrfs:btrfs_transaction_commit {
-    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\","
-           "\"gen\":%llu,\"ts\":%llu}\n",
+    printf("{\"tid\":%d,\"comm\":\"%s\",\"action\":\"TransactionCommit\",\"gen\":%llu,\"ts\":%llu}\n",
         tid, comm, args->generation, nsecs);
     /* After commit, pinned extents are released — clear freed map */
     clear(@freed);
 }
 
 interval:s:5 {
-    printf("{\"action\":\"PeriodicStats\","
-           "\"allocated\":%lld,\"discard_pending\":%lld,\"ts\":%llu}\n",
+    printf("{\"action\":\"PeriodicStats\",\"allocated\":%lld,\"discard_pending\":%lld,\"ts\":%llu}\n",
         count(@allocated), count(@discard_pending), nsecs);
 }
 

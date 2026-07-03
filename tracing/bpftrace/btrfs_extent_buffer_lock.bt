@@ -19,7 +19,7 @@
  *   btrfs_tree_unlock        - release write lock
  *   btrfs_tree_read_lock     - acquire read lock
  *   btrfs_tree_read_unlock   - release read lock
- *   btrfs_try_tree_write_lock - non-blocking write lock attempt
+ *   (btrfs_try_tree_write_lock was removed upstream in 6.15; not probed)
  *
  * Output: one JSON object per event on stdout.
  *
@@ -34,22 +34,23 @@ BEGIN {
 }
 
 /*
- * btrfs_tree_lock(struct extent_buffer *eb, int nest)
- * struct extent_buffer: level at offset 0x1c (u8, kernel 6.x)
- *                       start (bytenr) at offset 0x0
+ * btrfs_tree_lock_nested(struct extent_buffer *eb, enum btrfs_lock_nesting)
+ * level/owner are read from the on-disk btrfs_header at eb->addr (NULL for
+ * multi-page ebs without a contiguous mapping -> level=-1, owner=0).
  */
-kprobe:btrfs_tree_lock {
+kprobe:btrfs_tree_lock_nested {
     $eb    = (struct extent_buffer *)arg0;
-    $level = (uint8)$eb->level;
+    $level = $eb->addr != 0 ? (int64)((struct btrfs_header *)$eb->addr)->level : (int64)-1;
+    $owner = $eb->addr != 0 ? (uint64)((struct btrfs_header *)$eb->addr)->owner : (uint64)0;
     $start = $eb->start;
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireWrite\",\"level\":%d,\"bytenr\":%llu}\n",
-        nsecs, tid, comm, $level, $start);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireWrite\",\"level\":%d,\"bytenr\":%llu,\"owner\":%llu}\n",
+        nsecs, tid, comm, $level, $start, $owner);
     @lock_start[tid, $level] = nsecs;
     /* Track held set per thread for ordering check */
     @held_levels[tid] = @held_levels[tid] | (1 << $level);
 }
 
-kretprobe:btrfs_tree_lock {
+kretprobe:btrfs_tree_lock_nested {
     /* Lock acquired — record in held map */
     printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireWrite_Done\"}\n",
         nsecs, tid, comm);
@@ -57,45 +58,36 @@ kretprobe:btrfs_tree_lock {
 
 kprobe:btrfs_tree_unlock {
     $eb    = (struct extent_buffer *)arg0;
-    $level = (uint8)$eb->level;
+    $level = $eb->addr != 0 ? (int64)((struct btrfs_header *)$eb->addr)->level : (int64)-1;
+    $owner = $eb->addr != 0 ? (uint64)((struct btrfs_header *)$eb->addr)->owner : (uint64)0;
     $start = $eb->start;
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"Release\",\"level\":%d,\"bytenr\":%llu}\n",
-        nsecs, tid, comm, $level, $start);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"Release\",\"level\":%d,\"bytenr\":%llu,\"owner\":%llu}\n",
+        nsecs, tid, comm, $level, $start, $owner);
     @held_levels[tid] = @held_levels[tid] & ~(1 << $level);
     delete(@lock_start[tid, $level]);
 }
 
-kprobe:btrfs_tree_read_lock {
+kprobe:btrfs_tree_read_lock_nested {
     $eb    = (struct extent_buffer *)arg0;
-    $level = (uint8)$eb->level;
+    $level = $eb->addr != 0 ? (int64)((struct btrfs_header *)$eb->addr)->level : (int64)-1;
+    $owner = $eb->addr != 0 ? (uint64)((struct btrfs_header *)$eb->addr)->owner : (uint64)0;
     $start = $eb->start;
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireRead\",\"level\":%d,\"bytenr\":%llu}\n",
-        nsecs, tid, comm, $level, $start);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireRead\",\"level\":%d,\"bytenr\":%llu,\"owner\":%llu}\n",
+        nsecs, tid, comm, $level, $start, $owner);
 }
 
-kretprobe:btrfs_tree_read_lock {
+kretprobe:btrfs_tree_read_lock_nested {
     printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"AcquireRead_Done\"}\n",
         nsecs, tid, comm);
 }
 
 kprobe:btrfs_tree_read_unlock {
     $eb    = (struct extent_buffer *)arg0;
-    $level = (uint8)$eb->level;
+    $level = $eb->addr != 0 ? (int64)((struct btrfs_header *)$eb->addr)->level : (int64)-1;
+    $owner = $eb->addr != 0 ? (uint64)((struct btrfs_header *)$eb->addr)->owner : (uint64)0;
     $start = $eb->start;
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReleaseRead\",\"level\":%d,\"bytenr\":%llu}\n",
-        nsecs, tid, comm, $level, $start);
-}
-
-kprobe:btrfs_try_tree_write_lock {
-    $eb    = (struct extent_buffer *)arg0;
-    $level = (uint8)$eb->level;
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"TryAcquireWrite\",\"level\":%d}\n",
-        nsecs, tid, comm, $level);
-}
-
-kretprobe:btrfs_try_tree_write_lock {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"TryAcquireWrite_Done\",\"success\":%d}\n",
-        nsecs, tid, comm, (int32)retval);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"ReleaseRead\",\"level\":%d,\"bytenr\":%llu,\"owner\":%llu}\n",
+        nsecs, tid, comm, $level, $start, $owner);
 }
 
 END {
