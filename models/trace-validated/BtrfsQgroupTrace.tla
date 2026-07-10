@@ -75,4 +75,28 @@ TSpec == TInit /\ [][TNext]_tvars
 \* Violated exactly when the full trace has been replayed => success.
 TraceNotDone == idx <= Len(Trace)
 
+(***************************************************************************)
+(* Witness probes (see the *_probe_*.cfg files): each is a NEGATED         *)
+(* reachability question, so "Invariant X is violated" means the trace     *)
+(* DID exercise that window, and "Invariant TraceNotDone is violated"      *)
+(* means the trace replayed fully without ever entering it. Used to check  *)
+(* whether the workload reached the CVE-relevant interleavings at all —    *)
+(* action-level coverage cannot see cross-task state overlap.              *)
+(***************************************************************************)
+
+\* CVE-2025-39759 window: one task inside disable's wait_for_completion
+\* while another sits in the rescan ioctl's transaction-commit window
+\* (FLAG_RESCAN set, rescan_running still FALSE).
+NoDisableWaitDuringRescanCommit ==
+    ~(\E t1, t2 \in UserTasks :
+        t1 # t2 /\ pc[t1] = "r_commit"
+                /\ pc[t2] \in {"d_wait_read", "d_wait_block", "d_wait_done"})
+
+\* Proximity to the UAF itself: the free loop runs while any other task
+\* holds a live iterator into the qgroup tree.
+NoFreeWhileOtherIterates ==
+    ~(\E t \in UserTasks :
+        pc[t] \in {"d_free_enter", "d_free_lock", "d_free_do"}
+        /\ (iterating \ {t}) # {})
+
 ================================================================================

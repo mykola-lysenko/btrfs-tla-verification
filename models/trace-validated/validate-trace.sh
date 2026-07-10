@@ -5,6 +5,9 @@
 # Usage:
 #   bash validate-trace.sh <trace.jsonl> [max_events]
 #
+# COVERAGE=1 additionally prints a transition-coverage report (which model
+# actions the trace exercised) via coverage_report.py.
+#
 # Requires: docker image btrfs-trace:latest (has java),
 #           ~/qemu-btrfs/tlc/tla2tools.jar
 set -euo pipefail
@@ -18,13 +21,14 @@ IMAGE="${IMAGE:-btrfs-trace:latest}"
 
 python3 "$REPO/tracing/trace_to_tla.py" "$TRACE" -o "$DIR" --max-events "$MAX"
 
-LOG="$(mktemp)"
+LOG="$DIR/last-validate.log"
 docker run --rm \
     -v "$(dirname "$TLC_JAR")":/tlc:ro \
     -v "$DIR":/spec -w /spec \
     "$IMAGE" \
     java -XX:+UseParallelGC -cp /tlc/tla2tools.jar tlc2.TLC \
-         -workers "$(nproc)" -config BtrfsQgroupTrace.cfg BtrfsQgroupTrace.tla > "$LOG" 2>&1 || true
+         -workers "$(nproc)" -coverage 1 \
+         -config "${TRACE_CFG:-BtrfsQgroupTrace.cfg}" BtrfsQgroupTrace.tla > "$LOG" 2>&1 || true
 
 grep -E 'states generated|distinct states' "$LOG" | head -2
 NEVENTS=$(python3 - "$DIR/BtrfsQgroupTraceData.tla" <<'PY'
@@ -36,7 +40,33 @@ PY
 if grep -q "Invariant TraceNotDone is violated" "$LOG"; then
     # The whole trace was replayed (idx advanced past the last event).
     echo "RESULT: TRACE ACCEPTED — all $NEVENTS events are a behavior of BtrfsQgroupLifecycle"
-    rm -f "$LOG"; exit 0
+    if [ "${COVERAGE:-0}" = "1" ]; then
+        echo
+        python3 "$DIR/coverage_report.py" "$LOG"
+    fi
+    if [ "${PROBES:-0}" = "1" ]; then
+        echo
+        echo "== Witness probes (did the trace enter the CVE-relevant windows?) =="
+        for cfg in "$DIR"/BtrfsQgroupTrace_probe_*.cfg; do
+            name="$(basename "$cfg" .cfg)"; name="${name#BtrfsQgroupTrace_probe_}"
+            PLOG="$DIR/last-probe-$name.log"
+            docker run --rm \
+                -v "$(dirname "$TLC_JAR")":/tlc:ro \
+                -v "$DIR":/spec -w /spec \
+                "$IMAGE" \
+                java -XX:+UseParallelGC -cp /tlc/tla2tools.jar tlc2.TLC \
+                     -workers "$(nproc)" \
+                     -config "$(basename "$cfg")" BtrfsQgroupTrace.tla > "$PLOG" 2>&1 || true
+            if grep -qE "Invariant No\w+ is violated" "$PLOG"; then
+                echo "  $name: ENTERED — the trace is consistent with reaching this window"
+            elif grep -q "Invariant TraceNotDone is violated" "$PLOG"; then
+                echo "  $name: never entered (full replay without reaching the window)"
+            else
+                echo "  $name: INCONCLUSIVE — see $PLOG"
+            fi
+        done
+    fi
+    exit 0
 elif grep -qE "Deadlock reached" "$LOG"; then
     # Divergence: report idx from the terminal state (how far replay got).
     REACHED=$(grep -oE '/\\ idx = [0-9]+' "$LOG" | tail -1 | grep -oE '[0-9]+')

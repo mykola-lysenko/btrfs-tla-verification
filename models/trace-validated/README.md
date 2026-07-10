@@ -65,6 +65,56 @@ whole trace, the run is an accepted behavior of the model (reported as the
 `TraceNotDone` invariant being violated). If TLC gets stuck, the model diverges
 from the kernel at that event — which is a finding to feed back into the model.
 
+## Part 3 — how much does "ACCEPTED" actually mean?
+
+Acceptance alone is one-sided: it proves the model is not too *restrictive*
+(it can explain real kernel behavior), but a model that allows everything
+would also accept every trace. Two additional checks bound the claim from
+the other side, and a third measures how much of the model the trace vouches
+for.
+
+### Mutation testing (is the model too permissive?)
+
+```bash
+bash models/trace-validated/mutation-test.sh \
+     workloads/results/qgroup_<TS>/trace.jsonl
+```
+
+`tracing/mutate_trace.py` generates trace mutants that are **illegal by
+construction** — they violate per-task program order or queue→worker
+causality, orderings the kernel cannot produce: same-task event swaps,
+dropped `*_Enter`s (orphaning the later event), duplicated `*_Done`s, and
+worker starts moved before any possible queue event. A faithful model must
+reject all of them; unmutated truncated prefixes run as controls and must
+still be accepted. Cross-task swaps of independent events are deliberately
+NOT generated — those are usually legal alternative interleavings.
+
+### Transition coverage (which parts of the model does the trace vouch for?)
+
+```bash
+COVERAGE=1 PROBES=1 bash models/trace-validated/validate-trace.sh <trace.jsonl>
+```
+
+`coverage_report.py` maps TLC's `-coverage` output back to the model's
+actions and reports which were never taken during replay; flow arithmetic
+between adjacent actions recovers branch coverage (e.g. how often disable's
+`wait_for_completion` saw `rescan_running == FALSE` — the CVE hole
+precondition). The `PROBES=1` runs check *cross-task state overlap* that
+action counts cannot see, as negated-reachability witness invariants: did
+the trace ever have a disable inside the wait while another task sat in the
+rescan commit window (the CVE setup), or the free loop running while anyone
+held a live iterator?
+
+For the 1422-event reference trace: **38/43 actions exercised** and **all
+24 mutants killed with both controls accepted**, but both witness probes
+report *never entered* — every one of the 89 disables sailed through the
+wait (`D_WaitBlocked` never fired), yet no rescan was concurrently in its
+commit window. So the trace validates the lock/flag protocol and the happy
+paths thoroughly, while the CVE-window interleaving itself rests on the
+model-checking part (Part 1) plus code reading — an adversarial workload
+(concurrent `quota enable/disable/rescan` loops from separate threads) is
+the natural way to close that gap.
+
 ## What the validation loop actually taught the model
 
 Each divergence during bring-up was a real correction, exactly the point of the
