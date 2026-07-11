@@ -58,6 +58,14 @@ case "$SUBSYSTEM" in
         mkfs.btrfs -f -n 4096 "${DISKS[0]}" >/dev/null
         DEV="${DISKS[0]}"
         ;;
+    qgroup-race)
+        # Span all scratch disks for a big metadata working set, and use a
+        # small nodesize so the same metadata spreads over MORE leaves —
+        # each commit and rescan touches more of the tree, widening the
+        # CVE-2025-39759 window this workload targets.
+        mkfs.btrfs -f -n 4096 -m single -d single "${DISKS[@]}" >/dev/null
+        DEV="${DISKS[0]}"
+        ;;
     *)
         mkfs.btrfs -f "${DISKS[0]}" >/dev/null
         DEV="${DISKS[0]}"

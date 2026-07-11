@@ -133,9 +133,51 @@ report *never entered* — every one of the 89 disables sailed through the
 wait (`D_WaitBlocked` never fired), yet no rescan was concurrently in its
 commit window. So the trace validates the lock/flag protocol and the happy
 paths thoroughly, while the CVE-window interleaving itself rests on the
-model-checking part (Part 1) plus code reading — an adversarial workload
-(concurrent `quota enable/disable/rescan` loops from separate threads) is
-the natural way to close that gap.
+model-checking part (Part 1) plus code reading.
+
+### Part 4 — witnessing the window in a real kernel
+
+That gap is now closed empirically. `workloads/qgroup-race/` is an
+adversarial workload built to hit the window: a fat, slow-to-commit
+filesystem (all scratch disks, 4K nodes, thousands of small files +
+continuous metadata churn to widen `btrfs_commit_transaction`) with
+*independent concurrent* enable / rescan / disable loops (rescan takes no
+`subvol_sem`, so it genuinely races disable). Run it and scan the trace:
+
+```bash
+bash qemu/run-vm-trace.sh qgroup-race 240 kprobe
+python3 tracing/qgroup_window_scan.py workloads/results/qgroup-race_<TS>/trace.jsonl --merge-fs
+```
+
+`qgroup_window_scan.py` reports **wall-clock overlaps** of the kprobe
+intervals — the same windows the model probes describe, but as timestamped
+empirical events (no replay). A 240s run (btrfs-devel 7.1-rc7, the *fixed*
+kernel) produced:
+
+- **4× `free_vs_iter`** — `btrfs_free_qgroup_config` overlapping another
+  task's `qgroup_rescan_zero_tracking` (the UAF itself). Verified: e.g.
+  t2981's entire zero_tracking is nested inside t2979's free interval.
+- **154× `free_vs_worker`** — free overlapping the rescan *worker's* scan:
+  the second victim predicted by `_workerrace.cfg`, now witnessed.
+- **29× `wait_vs_commit`** — a disable's `wait_for_completion` overlapping a
+  rescan's commit window (the early-return precondition).
+
+The fixed kernel took no fault (`qgroup_lock` serialises the actual access),
+so this witnesses the *window*, not a crash — the model plus a KASAN build
+of the pre-fix kernel would be the escalation to an actual reproduced UAF.
+The point stands: the workload drove real execution into the interleaving
+every prior trace missed, and it entered all three windows the model flags,
+including the worker-victim one that only existed after this morning's
+model refinement.
+
+**Why the scanner and not model replay here:** replay's hand partial-order
+reduction (pin internal steps to the next event's task) is built for
+mostly-sequential traces; a 13,906-event trace with thousands of *genuinely
+overlapping* ops — exactly what the hammer produces — overwhelms it and it
+diverges. The wall-clock scanner is the right instrument for that regime,
+and it makes a more direct claim (real interval overlap) than replay's
+abstract reachability. Model replay still validates the ordinary and
+xfstests traces; the two are complementary.
 
 ## What the validation loop actually taught the model
 

@@ -34,7 +34,7 @@ run_tlc() {  # $1 = extra TLC args, $2 = log file
         -v "$(dirname "$TLC_JAR")":/tlc:ro \
         -v "$DIR":/spec -w /spec \
         "$IMAGE" \
-        java -XX:+UseParallelGC -cp /tlc/tla2tools.jar tlc2.TLC \
+        java -XX:+UseParallelGC -Xss512m -cp /tlc/tla2tools.jar tlc2.TLC \
              -workers "$(nproc)" $1 \
              -config "${TRACE_CFG:-BtrfsQgroupTrace.cfg}" BtrfsQgroupTrace.tla > "$2" 2>&1 || true
 }
@@ -65,7 +65,7 @@ if grep -q "Invariant TraceNotDone is violated" "$LOG"; then
                 -v "$(dirname "$TLC_JAR")":/tlc:ro \
                 -v "$DIR":/spec -w /spec \
                 "$IMAGE" \
-                java -XX:+UseParallelGC -cp /tlc/tla2tools.jar tlc2.TLC \
+                java -XX:+UseParallelGC -Xss512m -cp /tlc/tla2tools.jar tlc2.TLC \
                      -workers "$(nproc)" -deadlock \
                      -config "$(basename "$cfg")" BtrfsQgroupTrace.tla > "$PLOG" 2>&1 || true
             if grep -qE "Invariant No\w+ is violated" "$PLOG"; then

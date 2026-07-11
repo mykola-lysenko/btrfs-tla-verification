@@ -23,6 +23,7 @@
 # Examples:
 #   sudo bash run_trace_check.sh extent-buffer-lock /mnt/btrfs 60
 #   sudo bash run_trace_check.sh qgroup             /mnt/btrfs 60
+#   sudo bash run_trace_check.sh qgroup-race        /mnt/btrfs 240  # CVE-window hammer
 #   sudo bash run_trace_check.sh fsync-log-tree     /mnt/btrfs 120
 #   sudo bash run_trace_check.sh transaction-chain  /mnt/btrfs 120
 #   sudo bash run_trace_check.sh free-space-cache   /mnt/btrfs 60
@@ -61,6 +62,7 @@ declare -A BT_SCRIPT=(
     [extent-buffer-lock]="btrfs_extent_buffer_lock.bt"
     [free-space-cache]="btrfs_free_space_cache.bt"
     [qgroup]="btrfs_qgroup.bt"
+    [qgroup-race]="btrfs_qgroup.bt"
     [fsync-log-tree]="btrfs_fsync_log_tree.bt"
     [transaction-chain]="btrfs_transaction_chain.bt"
     [send-receive]="btrfs_send_receive.bt"
@@ -80,6 +82,7 @@ declare -A CHECKER=(
     [extent-buffer-lock]="btrfs_extent_buffer_lock_checker.py"
     [free-space-cache]="btrfs_free_space_cache_checker.py"
     [qgroup]="btrfs_qgroup_checker.py"
+    [qgroup-race]="btrfs_qgroup_checker.py"
     [fsync-log-tree]="btrfs_fsync_log_tree_checker.py"
     [transaction-chain]="btrfs_transaction_chain_checker.py"
 )
@@ -88,6 +91,7 @@ declare -A WORKLOAD_CMD=(
     [extent-buffer-lock]="python3 $WORKLOAD_DIR/workload.py --mount $MOUNT --threads 16 --duration $DURATION"
     [free-space-cache]="bash $WORKLOAD_DIR/workload.sh $MOUNT $DURATION"
     [qgroup]="bash $WORKLOAD_DIR/workload.sh $MOUNT $DURATION"
+    [qgroup-race]="bash $WORKLOAD_DIR/workload.sh $MOUNT $DURATION"
     [fsync-log-tree]="python3 $WORKLOAD_DIR/workload.py --mount $MOUNT --duration $DURATION"
     [transaction-chain]="python3 $WORKLOAD_DIR/workload.py --mount $MOUNT --threads 32 --duration $DURATION"
     [send-receive]="bash $WORKLOAD_DIR/workload.sh $MOUNT $DURATION"
