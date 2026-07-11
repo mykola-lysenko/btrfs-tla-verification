@@ -24,6 +24,13 @@
  *   qgroup_rescan_zero_tracking    - rescan iteration (internal)
  *   btrfs_qgroup_wait_for_completion - wait for rescan to finish
  *
+ * Every event carries "fs": the fs_info pointer. Workloads like xfstests
+ * run several btrfs filesystems at once (TEST_DEV + scratch), and their
+ * qgroup state machines are independent — trace_to_tla.py splits on this
+ * field. Entry probes read it from arg0; kretprobes read a per-tid stash
+ * (safe: nested qgroup calls on one tid are always on the same fs); the
+ * worker recovers it from its btrfs_work via container_of.
+ *
  * Output: one JSON object per event on stdout.
  */
 
@@ -33,58 +40,63 @@ BEGIN {
 }
 
 kprobe:btrfs_quota_enable {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaEnable_Enter\"}\n",
-        nsecs, tid, comm);
+    @fs[tid] = (uint64)arg0;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"QuotaEnable_Enter\"}\n",
+        nsecs, tid, comm, @fs[tid]);
 }
 kretprobe:btrfs_quota_enable {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaEnable_Done\",\"ret\":%d}\n",
-        nsecs, tid, comm, (int32)retval);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"QuotaEnable_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, @fs[tid], (int32)retval);
 }
 
 kprobe:btrfs_quota_disable {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaDisable_Enter\"}\n",
-        nsecs, tid, comm);
+    @fs[tid] = (uint64)arg0;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"QuotaDisable_Enter\"}\n",
+        nsecs, tid, comm, @fs[tid]);
     @disabling[tid] = 1;
 }
 kretprobe:btrfs_quota_disable {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QuotaDisable_Done\",\"ret\":%d}\n",
-        nsecs, tid, comm, (int32)retval);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"QuotaDisable_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, @fs[tid], (int32)retval);
     delete(@disabling[tid]);
 }
 
 kprobe:btrfs_qgroup_rescan {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupRescan_Enter\"}\n",
-        nsecs, tid, comm);
+    @fs[tid] = (uint64)arg0;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"QgroupRescan_Enter\"}\n",
+        nsecs, tid, comm, @fs[tid]);
     @rescan_active[tid] = 1;
     @rescan_count = @rescan_count + 1;
 }
 kretprobe:btrfs_qgroup_rescan {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"QgroupRescan_Done\",\"ret\":%d}\n",
-        nsecs, tid, comm, (int32)retval);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"QgroupRescan_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, @fs[tid], (int32)retval);
     delete(@rescan_active[tid]);
 }
 
 kprobe:btrfs_free_qgroup_config {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FreeQgroupConfig_Enter\"}\n",
-        nsecs, tid, comm);
+    @fs[tid] = (uint64)arg0;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"FreeQgroupConfig_Enter\"}\n",
+        nsecs, tid, comm, @fs[tid]);
     /* CVE-2025-39759: if rescan is running and we're freeing without lock -> UAF */
     if (@rescan_count > 0) {
-        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"VIOLATION_UAF\",\"rescan_count\":%d}\n",
-            nsecs, tid, comm, @rescan_count);
+        printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"VIOLATION_UAF\",\"rescan_count\":%d}\n",
+            nsecs, tid, comm, @fs[tid], @rescan_count);
     }
 }
 kretprobe:btrfs_free_qgroup_config {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"FreeQgroupConfig_Done\"}\n",
-        nsecs, tid, comm);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"FreeQgroupConfig_Done\"}\n",
+        nsecs, tid, comm, @fs[tid]);
 }
 
 kprobe:qgroup_rescan_zero_tracking {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanZeroTracking_Enter\"}\n",
-        nsecs, tid, comm);
+    @fs[tid] = (uint64)arg0;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"RescanZeroTracking_Enter\"}\n",
+        nsecs, tid, comm, @fs[tid]);
 }
 kretprobe:qgroup_rescan_zero_tracking {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanZeroTracking_Done\",\"ret\":%d}\n",
-        nsecs, tid, comm, (int32)retval);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"RescanZeroTracking_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, @fs[tid], (int32)retval);
     if (@rescan_count > 0) { @rescan_count = @rescan_count - 1; }
 }
 
@@ -93,27 +105,31 @@ kretprobe:qgroup_rescan_zero_tracking {
  * signals qgroup_rescan_completion — without these events the trace has an
  * invisible actor. btrfs_qgroup_rescan_worker is static but is used as a
  * work-queue function pointer (btrfs_init_work), so it is never inlined.
+ * Its argument is the embedded btrfs_work; container_of recovers fs_info.
  */
 kprobe:btrfs_qgroup_rescan_worker {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanWorker_Enter\"}\n",
-        nsecs, tid, comm);
+    @fs[tid] = (uint64)arg0 - (uint64)offsetof(struct btrfs_fs_info, qgroup_rescan_work);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"RescanWorker_Enter\"}\n",
+        nsecs, tid, comm, @fs[tid]);
 }
 kretprobe:btrfs_qgroup_rescan_worker {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"RescanWorker_Done\"}\n",
-        nsecs, tid, comm);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"RescanWorker_Done\"}\n",
+        nsecs, tid, comm, @fs[tid]);
 }
 
 kprobe:btrfs_qgroup_wait_for_completion {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitRescanCompletion_Enter\"}\n",
-        nsecs, tid, comm);
+    @fs[tid] = (uint64)arg0;
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"WaitRescanCompletion_Enter\"}\n",
+        nsecs, tid, comm, @fs[tid]);
 }
 kretprobe:btrfs_qgroup_wait_for_completion {
-    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"action\":\"WaitRescanCompletion_Done\",\"ret\":%d}\n",
-        nsecs, tid, comm, (int32)retval);
+    printf("{\"ts\":%llu,\"tid\":%d,\"comm\":\"%s\",\"fs\":%llu,\"action\":\"WaitRescanCompletion_Done\",\"ret\":%d}\n",
+        nsecs, tid, comm, @fs[tid], (int32)retval);
 }
 
 END {
     clear(@disabling);
     clear(@rescan_active);
+    clear(@fs);
     printf("# btrfs_qgroup trace ended.\n");
 }

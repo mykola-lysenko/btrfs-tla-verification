@@ -24,7 +24,7 @@ pass=0; fail=0
 printf '%-22s %-8s %-44s %s\n' "mutant" "expect" "result" "verdict"
 while IFS=$'\t' read -r name op expect diverge_by n_events detail; do
     [ "$name" = "name" ] && continue
-    out="$(bash "$DIR/validate-trace.sh" "$MUTDIR/$name.jsonl" 2>&1)"
+    out="$(DIAG=0 bash "$DIR/validate-trace.sh" "$MUTDIR/$name.jsonl" 2>&1)"
     rc=$?
     result="$(printf '%s\n' "$out" | grep '^RESULT:' | sed 's/^RESULT: //' | cut -c1-44)"
     if [ "$expect" = "ACCEPT" ]; then

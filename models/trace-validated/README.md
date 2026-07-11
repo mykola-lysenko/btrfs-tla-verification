@@ -137,8 +137,48 @@ things):
    scan paused mid-disable. Without this the replay diverged on the
    enable-after-paused-rescan sequence.
 
+The first xfstests trace (btrfs/022, via `qemu/run-vm-xfstests.sh`) taught
+three more, none of which the hand-rolled workload could reach:
+
+5. **The unmount path**: `close_ctree` calls
+   `btrfs_qgroup_wait_for_completion` and then `btrfs_free_qgroup_config`
+   unconditionally — even on filesystems that never enabled quota. The free
+   is the same function as in disable, so the CVE fix (and the UAF
+   emergence rule) applies at this second call site too; modeled as the
+   `UmountBegin`/`M_*` actions, with `~Closing` gates on ioctl entry (VFS:
+   a busy fs fails umount before `close_ctree` runs).
+6. **The completion is a second anticipatory handoff**: `complete_all` runs
+   *inside* the worker, so a waiter's `WaitRescanCompletion_Done` can
+   precede the worker's own `RescanWorker_Done` (kretprobe at function
+   exit). The replay spec allows `W_ExitLoop`/`W_Finish` as free steps,
+   exactly like `Enqueue`.
+7. **Ambiguous observables need deadlock-tolerant replay**:
+   `WaitRescanCompletion_Enter` is both the rescan-wait ioctl and unmount,
+   so replay forks and the wrong branch dies in a sink state. TLC now runs
+   with `-deadlock`; the verdict rests solely on `TraceNotDone` (violated
+   = accepted; clean finish = divergence).
+
+And the full `-g qgroup` group run (36 tests) taught one more:
+
+8. **Simple quotas are a separate enable path**: squota
+   (`BTRFS_QUOTA_CTL_ENABLE_SIMPLE_QUOTA`, the btrfs/301+ tests) skips the
+   entire rescan machinery — enable returns with no zero-tracking and no
+   worker. 15 of 51 per-fs groups diverged with exactly this signature
+   until `E_SimpleSkip` modeled the branch. (The model does not track
+   SIMPLE_MODE; see the comment on that action for the deliberate
+   over-approximation.)
+
+Traces also carry an `"fs"` field now (the fs_info pointer): xfstests
+mounts several btrfs filesystems at once (TEST_DEV + scratch, and each
+re-mkfs is a fresh fs_info — one 36-test group run produced 51 quota-active
+incarnations); `trace_to_tla.py` splits on it and validates the
+quota-active group (`--fs` overrides, `TRACE_FS` env in validate-trace.sh).
+
 The result is a model that (a) reproduces the historical CVE as an emergent
-counterexample and (b) accepts 1422 events of real 7.1-rc7 kernel execution.
+counterexample and (b) accepts every real 7.1-rc7 trace thrown at it so
+far: 1422 events of the hand-rolled workload, the xfstests btrfs/022 run,
+and all 51 quota-active filesystem incarnations of the full xfstests
+`-g qgroup` group run (unmount cycles, standalone waits, squota and all).
 
 ## Requirements
 
@@ -158,5 +198,11 @@ counterexample and (b) accepts 1422 events of real 7.1-rc7 kernel execution.
   action. Finer bugs (within a critical section) are out of scope by design —
   that is the standard TLA+ altitude choice, and it is what keeps the state
   space checkable.
+- Unmount is modeled as a full in-memory reset, which is correct for
+  xfstests-style cycles (each subtest re-mkfs's the scratch device). A
+  remount that PRESERVES on-disk quota state (`btrfs_read_qgroup_config`,
+  rescan resume at mount) is not modeled yet — a trace doing that will
+  diverge at the quota activity that has no preceding enable, which is the
+  signal to add the mount-path transitions.
 - To validate against a different kernel, re-capture the trace; if a genuinely
   new interleaving appears, the model will diverge and needs a new transition.

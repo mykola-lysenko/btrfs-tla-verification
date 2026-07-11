@@ -6,13 +6,17 @@
 (*                                                                         *)
 (* Each step either (a) matches the next observable trace event and       *)
 (* advances idx, or (b) performs an internal (unobserved) model action.    *)
-(* Consuming the whole trace violates the pseudo-invariant TraceNotDone —  *)
-(* so with TLC:                                                            *)
+(* Consuming the whole trace violates the pseudo-invariant TraceNotDone.   *)
 (*                                                                         *)
-(*   "Invariant TraceNotDone is violated"  => TRACE ACCEPTED (success!)    *)
-(*   "Deadlock reached"                    => DIVERGENCE at Trace[idx]:    *)
-(*        the model cannot explain the next event; the deadlock state      *)
-(*        shows how far validation got and what the model state was.       *)
+(* Some observable events are ambiguous (WaitRescanCompletion_Enter is     *)
+(* both the rescan-wait ioctl and close_ctree at unmount), so replay       *)
+(* forks branches and wrong branches die in sink states. TLC must run      *)
+(* with -deadlock (deadlock checking OFF); the verdict is then:            *)
+(*                                                                         *)
+(*   "Invariant TraceNotDone is violated" => TRACE ACCEPTED — some branch  *)
+(*        consumed the whole trace (success!)                              *)
+(*   "No error has been found"            => DIVERGENCE — every branch     *)
+(*        got stuck before the end of the trace.                           *)
 (*                                                                         *)
 (* Run via validate-trace.sh, which interprets the TLC output.             *)
 (***************************************************************************)
@@ -44,30 +48,35 @@ NextTask == IF idx <= Len(Trace) THEN Trace[idx].task ELSE NoTask
 InternalOf(t) ==
     \/ (t \in UserTasks) /\
         (\/ E_Check(t) \/ E_Create(t) \/ E_SetRoot(t) \/ E_RescanInit(t)
-         \/ E_ZTLock(t) \/ E_ZTUnlock(t) \/ E_Queue(t)
+         \/ E_SimpleSkip(t) \/ E_ZTLock(t) \/ E_ZTUnlock(t) \/ E_Queue(t)
          \/ D_Check(t) \/ D_ClearEnabled(t) \/ D_WaitEnter(t) \/ D_WaitRead(t)
          \/ D_WaitBlocked(t) \/ D_WaitDone(t) \/ D_Trans(t) \/ D_ClearRoot(t)
          \/ D_FreeLock(t) \/ D_FreeDo(t) \/ D_Clean(t)
-         \/ R_Init(t) \/ R_Commit(t) \/ R_ZTLock(t) \/ R_ZTUnlock(t) \/ R_Queue(t))
-    \* NB: the standalone btrfs_qgroup_wait_for_completion path (UserWait*/
-    \* U_Wait*) is intentionally excluded here. It starts from "idle", so
-    \* including it would let an idle task spuriously enter a wait it never
-    \* performed and then be unable to start the operation the trace shows.
-    \* This workload issues no `quota rescan -w`, so the path is unobserved.
+         \/ R_Init(t) \/ R_Commit(t) \/ R_ZTLock(t) \/ R_ZTUnlock(t) \/ R_Queue(t)
+         \* standalone wait / unmount: only the mid-operation internals —
+         \* their entry points (UserWaitEnter, UmountBegin) are observable,
+         \* so an idle task cannot wander into these paths spuriously
+         \/ U_WaitRead(t) \/ U_WaitBlocked(t)
+         \/ M_WaitRead(t) \/ M_WaitBlocked(t) \/ M_FreeLock(t) \/ M_FreeDo(t))
     \/ (t = Worker) /\ (W_ExitLoop \/ W_Finish)
 
-\* The one anticipatory cross-task step: enqueue the rescan work. This sets
-\* workerQueued, enabling the worker's RescanWorker_Enter, which can occur
-\* before the queueing ioctl returns (its Done event comes later in the
-\* trace). Any OTHER hidden cross-task dependency would deadlock TLC.
-Enqueue == \E t \in UserTasks : E_Queue(t) \/ R_Queue(t)
+\* Anticipatory cross-task steps — handoffs whose effect precedes the
+\* handing task's next observable event. Two exist in this protocol:
+\*   Enqueue: E_Queue/R_Queue set workerQueued, enabling RescanWorker_Enter
+\*     before the queueing ioctl returns (its Done event comes later).
+\*   WorkerFinish: W_ExitLoop/W_Finish run complete_all INSIDE the worker,
+\*     unblocking a waiter's WaitRescanCompletion_Done before the worker's
+\*     own RescanWorker_Done (the kretprobe at function exit) appears.
+\* Any OTHER hidden cross-task dependency would deadlock TLC.
+Enqueue      == \E t \in UserTasks : E_Queue(t) \/ R_Queue(t)
+WorkerFinish == W_ExitLoop \/ W_Finish
 
 TNext ==
     \/ /\ idx <= Len(Trace)
        /\ Observable(Trace[idx].task, Trace[idx].action)
        /\ idx' = idx + 1
     \/ /\ idx <= Len(Trace)
-       /\ (InternalOf(NextTask) \/ Enqueue)
+       /\ (InternalOf(NextTask) \/ Enqueue \/ WorkerFinish)
        /\ UNCHANGED idx
 
 TSpec == TInit /\ [][TNext]_tvars
@@ -92,11 +101,12 @@ NoDisableWaitDuringRescanCommit ==
         t1 # t2 /\ pc[t1] = "r_commit"
                 /\ pc[t2] \in {"d_wait_read", "d_wait_block", "d_wait_done"})
 
-\* Proximity to the UAF itself: the free loop runs while any other task
-\* holds a live iterator into the qgroup tree.
+\* Proximity to the UAF itself: the free loop (from disable OR unmount)
+\* runs while any other task holds a live iterator into the qgroup tree.
 NoFreeWhileOtherIterates ==
     ~(\E t \in UserTasks :
-        pc[t] \in {"d_free_enter", "d_free_lock", "d_free_do"}
+        pc[t] \in {"d_free_enter", "d_free_lock", "d_free_do",
+                   "m_free_enter", "m_free_lock", "m_free_do"}
         /\ (iterating \ {t}) # {})
 
 ================================================================================

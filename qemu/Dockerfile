@@ -32,4 +32,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         default-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
+# xfstests: the filesystem regression suite, built in-image so the guest can
+# run it as a workload engine (see qemu/run-vm-xfstests.sh). Its qgroup and
+# quota test groups encode historical race reproducers — pre-built
+# adversarial workloads for the trace-validated models.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        autoconf automake libtool libtool-bin gettext pkg-config make \
+        libacl1-dev libattr1-dev libaio-dev libcap-dev uuid-dev zlib1g-dev \
+        liburing-dev libgdbm-dev \
+        xfsprogs xfslibs-dev e2fsprogs \
+        gawk psmisc quota bc uuid-runtime fio dbench duperemove \
+    && rm -rf /var/lib/apt/lists/*
+
+# Test users many xfstests cases run as (the numeric-prefix one is optional
+# and newer shadow versions gate it behind --badname).
+RUN useradd -m fsgqa && useradd -m fsgqa2 \
+    && { useradd -m --badname 123456-fsgqa 2>/dev/null \
+         || useradd -m --force-badname 123456-fsgqa 2>/dev/null || true; }
+
+RUN git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /opt/xfstests \
+    && cd /opt/xfstests \
+    && git rev-parse HEAD > GITCOMMIT \
+    && make -j"$(nproc)" \
+    && rm -rf .git
+
 WORKDIR /work

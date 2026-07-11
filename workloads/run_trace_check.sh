@@ -14,6 +14,12 @@
 # Usage:
 #   sudo bash run_trace_check.sh <subsystem> <mount> [duration_secs]
 #
+# Env:
+#   WORKLOAD_OVERRIDE — run this command as the workload instead of the
+#                       subsystem's default (e.g. an xfstests ./check run);
+#                       <subsystem> still selects the tracer + checker
+#   OUT_DIR           — results directory (default workloads/results/<subsystem>_<ts>)
+#
 # Examples:
 #   sudo bash run_trace_check.sh extent-buffer-lock /mnt/btrfs 60
 #   sudo bash run_trace_check.sh qgroup             /mnt/btrfs 60
@@ -109,7 +115,7 @@ fi
 
 # Create output directory
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUT_DIR="$SCRIPT_DIR/results/${SUBSYSTEM}_${TIMESTAMP}"
+OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/results/${SUBSYSTEM}_${TIMESTAMP}}"
 mkdir -p "$OUT_DIR"
 TRACE_FILE="$OUT_DIR/trace.jsonl"
 REPORT_FILE="$OUT_DIR/report.txt"
@@ -164,8 +170,9 @@ fi
 # Run workload
 # -----------------------------------------------------------------------
 echo "[harness] Starting workload..."
-WORKLOAD="${WORKLOAD_CMD[$SUBSYSTEM]+x}"
-if [[ -n "${WORKLOAD_CMD[$SUBSYSTEM]+x}" ]]; then
+if [[ -n "${WORKLOAD_OVERRIDE:-}" ]]; then
+    eval "$WORKLOAD_OVERRIDE" || true
+elif [[ -n "${WORKLOAD_CMD[$SUBSYSTEM]+x}" ]]; then
     eval "${WORKLOAD_CMD[$SUBSYSTEM]}" || true
 else
     echo "[harness] No workload defined for $SUBSYSTEM — running for ${DURATION}s..."

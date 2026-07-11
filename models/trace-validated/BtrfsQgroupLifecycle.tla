@@ -31,8 +31,19 @@
 (*     qgroup_lock (qgroup.c:677); before the fix it iterated bare.        *)
 (*   - btrfs_qgroup_rescan_worker (qgroup.c:3852): scans while             *)
 (*     rescan_should_stop() is false (it stops when QUOTA_ENABLED is       *)
-(*     cleared), then under rescan_lock clears FLAG_RESCAN (only if not    *)
-(*     stopped), clears rescan_running, complete_all(completion).          *)
+(*     cleared OR the fs is closing), then under rescan_lock clears        *)
+(*     FLAG_RESCAN (only if not stopped), clears rescan_running,           *)
+(*     complete_all(completion).                                           *)
+(*   - close_ctree (unmount, disk-io.c): sets BTRFS_FS_CLOSING, calls      *)
+(*     btrfs_qgroup_wait_for_completion, later btrfs_free_qgroup_config —  *)
+(*     unconditionally, even if quota was never enabled. The freed fs_info *)
+(*     means a subsequent mount starts from fresh in-memory state. VFS     *)
+(*     guarantees no quota ioctl is in flight once umount proceeds (open   *)
+(*     fds make umount fail with EBUSY before close_ctree runs).           *)
+(*   - the standalone btrfs_qgroup_wait_for_completion callers (the        *)
+(*     rescan-wait ioctl and close_ctree) are out-of-TU, so their kprobe   *)
+(*     fires: WaitRescanCompletion_* is observable there; the copy inlined *)
+(*     into btrfs_quota_disable emits nothing and stays internal.          *)
 (*                                                                         *)
 (* The CVE-2025-39759 race this model reproduces when                      *)
 (* FixFreeHoldsQgroupLock = FALSE:                                         *)
@@ -90,8 +101,17 @@ UserPCs == {"idle",
             "r_init", "r_commit", "r_zt_enter", "r_zt_iter", "r_zt_done",
             "r_queue", "r_done",
             \* standalone btrfs_qgroup_wait_for_completion (rescan -w etc.)
-            "u_wait_read", "u_wait_block", "u_wait_done"}
+            "u_wait_read", "u_wait_block", "u_wait_done",
+            \* close_ctree (unmount): wait, free config, teardown
+            "m_wait_read", "m_wait_block", "m_wait_done",
+            "m_free_enter", "m_free_lock", "m_free_do", "m_free_done"}
 WorkerPCs == {"w_idle", "w_run", "w_finish", "w_exit"}
+
+\* A task inside the unmount path = BTRFS_FS_CLOSING is set (close_ctree
+\* sets it before the qgroup teardown steps modeled here).
+MStates  == {"m_wait_read", "m_wait_block", "m_wait_done",
+             "m_free_enter", "m_free_lock", "m_free_do", "m_free_done"}
+Closing  == \E t \in Tasks : pc[t] \in MStates
 
 TypeOK ==
     /\ quotaRoot \in BOOLEAN /\ quotaEnabled \in BOOLEAN
@@ -121,6 +141,7 @@ Init ==
 
 QuotaEnableEnter(t) ==      \* observable: QuotaEnable_Enter
     /\ t \in UserTasks /\ pc[t] = "idle" /\ subvolSem = NoTask
+    /\ ~Closing              \* an in-flight ioctl fd would have failed umount
     /\ subvolSem' = t
     /\ pc' = [pc EXCEPT ![t] = "e_check"]
     /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
@@ -154,6 +175,22 @@ E_SetRoot(t) ==             \* internal: qgroup.c:1254-1259, under qgroup_lock
     /\ UNCHANGED <<flagOn, flagRescan, rescanRunning, completionDone,
                    workerQueued, workerStopped, qgroupLock, rescanLock,
                    subvolSem, iterating, uafOccurred>>
+
+E_SimpleSkip(t) ==          \* internal: simple-quotas enable (squota,
+                            \* BTRFS_QUOTA_CTL_ENABLE_SIMPLE_QUOTA) skips the
+                            \* rescan machinery entirely — no rescan_init, no
+                            \* zero_tracking, no worker. The full/simple
+                            \* choice is the ioctl argument, modeled as a
+                            \* nondeterministic branch here. (Deliberate
+                            \* over-approximation: the model does not track
+                            \* SIMPLE_MODE, so it permits a later rescan that
+                            \* the kernel would reject with -EINVAL; that
+                            \* only ADDS interleavings, all fix-protected.)
+    /\ pc[t] = "e_rescaninit"
+    /\ pc' = [pc EXCEPT ![t] = "e_done"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, qgroupLock,
+                   rescanLock, subvolSem, iterating, uafOccurred>>
 
 E_RescanInit(t) ==          \* internal: qgroup_rescan_init(fs_info, 0, 1)
     /\ pc[t] = "e_rescaninit" /\ rescanLock = NoTask
@@ -223,6 +260,7 @@ QuotaEnableDone(t) ==       \* observable: QuotaEnable_Done
 
 QuotaDisableEnter(t) ==     \* observable: QuotaDisable_Enter
     /\ t \in UserTasks /\ pc[t] = "idle" /\ subvolSem = NoTask
+    /\ ~Closing
     /\ subvolSem' = t
     /\ pc' = [pc EXCEPT ![t] = "d_check"]
     /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
@@ -344,7 +382,7 @@ QuotaDisableDone(t) ==      \* observable: QuotaDisable_Done
 (***************************************************************************)
 
 QgroupRescanEnter(t) ==     \* observable: QgroupRescan_Enter
-    /\ t \in UserTasks /\ pc[t] = "idle"
+    /\ t \in UserTasks /\ pc[t] = "idle" /\ ~Closing
     /\ pc' = [pc EXCEPT ![t] = "r_init"]
     /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
                    completionDone, workerQueued, workerStopped, qgroupLock,
@@ -422,11 +460,12 @@ QgroupRescanDone(t) ==      \* observable: QgroupRescan_Done
                    rescanLock, subvolSem, iterating, uafOccurred>>
 
 (***************************************************************************)
-(* Standalone btrfs_qgroup_wait_for_completion (quota rescan -w, etc.)     *)
+(* Standalone btrfs_qgroup_wait_for_completion (the rescan-wait ioctl:     *)
+(* quota rescan -w). Out-of-TU caller, so the kprobe fires: observable.    *)
 (***************************************************************************)
 
-UserWaitEnter(t) ==         \* internal (see D_WaitEnter)
-    /\ t \in UserTasks /\ pc[t] = "idle"
+UserWaitEnter(t) ==         \* observable: WaitRescanCompletion_Enter
+    /\ t \in UserTasks /\ pc[t] = "idle" /\ ~Closing
     /\ pc' = [pc EXCEPT ![t] = "u_wait_read"]
     /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
                    completionDone, workerQueued, workerStopped, qgroupLock,
@@ -446,12 +485,91 @@ U_WaitBlocked(t) ==         \* internal
                    completionDone, workerQueued, workerStopped, qgroupLock,
                    rescanLock, subvolSem, iterating, uafOccurred>>
 
-UserWaitDone(t) ==          \* internal (see D_WaitEnter)
+UserWaitDone(t) ==          \* observable: WaitRescanCompletion_Done
     /\ pc[t] = "u_wait_done"
     /\ pc' = [pc EXCEPT ![t] = "idle"]
     /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
                    completionDone, workerQueued, workerStopped, qgroupLock,
                    rescanLock, subvolSem, iterating, uafOccurred>>
+
+(***************************************************************************)
+(* close_ctree (unmount): wait_for_completion, then free_qgroup_config,    *)
+(* then the fs_info is torn down — a later mount starts fresh. The wait    *)
+(* and free are the same functions as in disable, so the fix constant and  *)
+(* the UAF emergence rule apply here identically. Entered only when no     *)
+(* other user task is mid-operation (VFS: busy fs fails umount).           *)
+(***************************************************************************)
+
+UmountBegin(t) ==           \* observable: WaitRescanCompletion_Enter
+    /\ t \in UserTasks /\ pc[t] = "idle"
+    /\ \A t2 \in UserTasks \ {t} : pc[t2] = "idle"
+    /\ pc' = [pc EXCEPT ![t] = "m_wait_read"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, qgroupLock,
+                   rescanLock, subvolSem, iterating, uafOccurred>>
+
+M_WaitRead(t) ==            \* internal: read rescan_running under rescan_lock
+    /\ pc[t] = "m_wait_read" /\ rescanLock = NoTask
+    /\ pc' = [pc EXCEPT ![t] = IF rescanRunning THEN "m_wait_block" ELSE "m_wait_done"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, qgroupLock,
+                   rescanLock, subvolSem, iterating, uafOccurred>>
+
+M_WaitBlocked(t) ==         \* internal: wait_for_completion(...)
+    /\ pc[t] = "m_wait_block" /\ completionDone
+    /\ pc' = [pc EXCEPT ![t] = "m_wait_done"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, qgroupLock,
+                   rescanLock, subvolSem, iterating, uafOccurred>>
+
+M_WaitDone(t) ==            \* observable: WaitRescanCompletion_Done
+    /\ pc[t] = "m_wait_done"
+    /\ pc' = [pc EXCEPT ![t] = "m_free_enter"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, qgroupLock,
+                   rescanLock, subvolSem, iterating, uafOccurred>>
+
+M_FreeEnter(t) ==           \* observable: FreeQgroupConfig_Enter
+    /\ pc[t] = "m_free_enter"
+    /\ pc' = [pc EXCEPT ![t] = IF FixFreeHoldsQgroupLock THEN "m_free_lock" ELSE "m_free_do"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, qgroupLock,
+                   rescanLock, subvolSem, iterating, uafOccurred>>
+
+M_FreeLock(t) ==            \* internal (fixed kernel): spin_lock(qgroup_lock)
+    /\ pc[t] = "m_free_lock" /\ qgroupLock = NoTask
+    /\ qgroupLock' = t
+    /\ pc' = [pc EXCEPT ![t] = "m_free_do"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, rescanLock,
+                   subvolSem, iterating, uafOccurred>>
+
+M_FreeDo(t) ==              \* internal: same UAF emergence rule as D_FreeDo
+    /\ pc[t] = "m_free_do"
+    /\ IF FixFreeHoldsQgroupLock THEN qgroupLock = t ELSE TRUE
+    /\ uafOccurred' = (uafOccurred \/ \E t2 \in iterating : t2 # t)
+    /\ qgroupLock' = IF FixFreeHoldsQgroupLock THEN NoTask ELSE qgroupLock
+    /\ pc' = [pc EXCEPT ![t] = "m_free_done"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, rescanLock,
+                   subvolSem, iterating>>
+
+M_FreeDone(t) ==            \* observable: FreeQgroupConfig_Done. Also folds
+                            \* in the teardown: the fs_info is destroyed and
+                            \* a later mount (xfstests re-mkfs's between
+                            \* subtests) starts from fresh in-memory state.
+                            \* Sound to fold: the ~Closing gates keep every
+                            \* other task out until this task is idle again,
+                            \* so nothing can observe a gap between the free
+                            \* returning and the teardown.
+    /\ pc[t] = "m_free_done"
+    /\ quotaRoot' = FALSE /\ quotaEnabled' = FALSE
+    /\ flagOn' = FALSE /\ flagRescan' = FALSE
+    /\ rescanRunning' = FALSE /\ completionDone' = FALSE
+    /\ workerQueued' = FALSE
+    /\ pc' = [pc EXCEPT ![t] = "idle"]
+    /\ UNCHANGED <<workerStopped, qgroupLock, rescanLock, subvolSem,
+                   iterating, uafOccurred>>
 
 (***************************************************************************)
 (* btrfs_qgroup_rescan_worker                                              *)
@@ -466,9 +584,10 @@ WorkerStart ==              \* observable: RescanWorker_Enter
                    subvolSem, iterating, uafOccurred>>
 
 W_ExitLoop ==               \* internal: scan loop exits; `stopped` is
-                            \* rescan_should_stop() = !quotaEnabled (approx.)
+                            \* rescan_should_stop() = !quotaEnabled or the
+                            \* fs is closing (unmount in progress)
     /\ pc[Worker] = "w_run"
-    /\ workerStopped' = ~quotaEnabled
+    /\ workerStopped' = (~quotaEnabled \/ Closing)
     /\ pc' = [pc EXCEPT ![Worker] = "w_finish"]
     /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
                    completionDone, workerQueued, qgroupLock, rescanLock,
@@ -504,8 +623,10 @@ Observable(t, a) ==
       [] a = "QgroupRescan_Done"          -> QgroupRescanDone(t)
       [] a = "RescanZeroTracking_Enter"   -> E_ZTEnter(t) \/ R_ZTEnter(t)
       [] a = "RescanZeroTracking_Done"    -> E_ZTDone(t) \/ R_ZTDone(t)
-      [] a = "FreeQgroupConfig_Enter"     -> D_FreeEnter(t)
-      [] a = "FreeQgroupConfig_Done"      -> D_FreeDone(t)
+      [] a = "WaitRescanCompletion_Enter" -> UserWaitEnter(t) \/ UmountBegin(t)
+      [] a = "WaitRescanCompletion_Done"  -> UserWaitDone(t) \/ M_WaitDone(t)
+      [] a = "FreeQgroupConfig_Enter"     -> D_FreeEnter(t) \/ M_FreeEnter(t)
+      [] a = "FreeQgroupConfig_Done"      -> D_FreeDone(t) \/ M_FreeDone(t)
       [] a = "RescanWorker_Enter"         -> WorkerStart
       [] a = "RescanWorker_Done"          -> WorkerDone
       [] OTHER                            -> FALSE
@@ -513,18 +634,20 @@ Observable(t, a) ==
 Internal ==
     \/ \E t \in UserTasks :
         \/ E_Check(t) \/ E_Create(t) \/ E_SetRoot(t) \/ E_RescanInit(t)
-        \/ E_ZTLock(t) \/ E_ZTUnlock(t) \/ E_Queue(t)
+        \/ E_SimpleSkip(t) \/ E_ZTLock(t) \/ E_ZTUnlock(t) \/ E_Queue(t)
         \/ D_Check(t) \/ D_ClearEnabled(t) \/ D_WaitEnter(t) \/ D_WaitRead(t)
         \/ D_WaitBlocked(t) \/ D_WaitDone(t) \/ D_Trans(t) \/ D_ClearRoot(t)
         \/ D_FreeLock(t) \/ D_FreeDo(t) \/ D_Clean(t)
         \/ R_Init(t) \/ R_Commit(t) \/ R_ZTLock(t) \/ R_ZTUnlock(t) \/ R_Queue(t)
-        \/ UserWaitEnter(t) \/ U_WaitRead(t) \/ U_WaitBlocked(t) \/ UserWaitDone(t)
+        \/ U_WaitRead(t) \/ U_WaitBlocked(t)
+        \/ M_WaitRead(t) \/ M_WaitBlocked(t) \/ M_FreeLock(t) \/ M_FreeDo(t)
     \/ W_ExitLoop \/ W_Finish
 
 ObservableNames == {"QuotaEnable_Enter", "QuotaEnable_Done",
                     "QuotaDisable_Enter", "QuotaDisable_Done",
                     "QgroupRescan_Enter", "QgroupRescan_Done",
                     "RescanZeroTracking_Enter", "RescanZeroTracking_Done",
+                    "WaitRescanCompletion_Enter", "WaitRescanCompletion_Done",
                     "FreeQgroupConfig_Enter", "FreeQgroupConfig_Done",
                     "RescanWorker_Enter", "RescanWorker_Done"}
 

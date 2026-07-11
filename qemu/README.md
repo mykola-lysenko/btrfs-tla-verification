@@ -46,6 +46,29 @@ bash qemu/run-vm-trace.sh raid56 120        # uses 3 scratch disks, -d raid5
 bash qemu/run-vm-trace.sh extent-buffer-lock 60 kprobe
 ```
 
+## xfstests as a traced workload
+
+xfstests is built into the image (`/opt/xfstests`, commit recorded in
+`GITCOMMIT`); its qgroup/quota groups are pre-built adversarial workloads —
+historical race reproducers — far nastier than the hand-rolled loops:
+
+```bash
+bash qemu/run-vm-xfstests.sh btrfs/022      # one test
+bash qemu/run-vm-xfstests.sh -g qgroup      # the whole qgroup group
+```
+
+The guest formats `TEST_DEV` on the first virtio disk and gives the rest to
+`SCRATCH_DEV_POOL`, then runs `./check` under the same tracer + trace-fidelity
+harness as the other workloads (`SUBSYSTEM`/`EDITION` env pick the tracer;
+default qgroup/kprobe, which is what the trace-validated TLA+ models consume).
+Results land in `workloads/results/xfstests_<TS>/`: `trace.jsonl` (the merged
+trace across all tests in the run — note each test remounts, so expect
+mount-path transitions like rescan-resume), `xfstests/` (per-test results,
+`check.log`, dmesg), and `check-exit.txt`. Feed the trace to
+`models/trace-validated/validate-trace.sh` (with `COVERAGE=1 PROBES=1`) — a
+divergence on an xfstests trace is refinement input, not necessarily a bug.
+`XFSTESTS_TIMEOUT` (default 3600s) hard-caps a hung `./check`.
+
 ## Known-good state (2026-07-02, kernel 7.1.0-rc7, bpftrace 0.25)
 
 - All 17 tracepoint scripts parse, attach, and emit events (after joining
@@ -89,6 +112,8 @@ bash qemu/run-vm-trace.sh extent-buffer-lock 60 kprobe
 | `build-kernel.sh` | Builds bzImage inside the container (rootless) |
 | `run-vm-trace.sh` | Boots the VM and runs one subsystem end-to-end |
 | `guest-run.sh` | Runs inside the guest: scratch mkfs/mount + harness |
+| `run-vm-xfstests.sh` | Boots the VM and runs xfstests as the traced workload |
+| `guest-xfstests.sh` | Runs inside the guest: TEST/SCRATCH setup + ./check |
 
 ## Kernel config highlights
 

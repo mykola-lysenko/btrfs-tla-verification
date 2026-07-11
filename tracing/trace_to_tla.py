@@ -8,12 +8,17 @@ real kernel execution is an accepted behavior of BtrfsQgroupLifecycle.tla.
 Transformations:
   - events are sorted by ts (bpftrace merges per-CPU buffers out of order)
   - only the model's observable actions are kept
+  - events are split by the "fs" field (fs_info pointer): each btrfs
+    filesystem is an independent qgroup state machine, and workloads like
+    xfstests mount several at once (TEST_DEV + scratch). By default the
+    group with quota activity (and the most events) is validated; --fs
+    overrides. Traces without the field (older captures) form one group.
   - RescanWorker_* events are attributed to the model's single "worker"
     process regardless of which kworker tid executed the work item
   - other tids become user tasks "t<tid>"
 
 Usage:
-  python3 trace_to_tla.py trace.jsonl [-o OUTDIR] [--max-events N]
+  python3 trace_to_tla.py trace.jsonl [-o OUTDIR] [--max-events N] [--fs FS]
 """
 import argparse
 import json
@@ -25,14 +30,15 @@ OBSERVABLE = {
     "QuotaDisable_Enter", "QuotaDisable_Done",
     "QgroupRescan_Enter", "QgroupRescan_Done",
     "RescanZeroTracking_Enter", "RescanZeroTracking_Done",
-    # WaitRescanCompletion_* excluded: the kernel inlines
-    # btrfs_qgroup_wait_for_completion into btrfs_quota_disable, so the
-    # kprobe fires for out-of-TU callers only (e.g. quota rescan -w) —
-    # the model treats the wait as internal.
+    # The btrfs_qgroup_wait_for_completion kprobe fires for out-of-TU
+    # callers only (the rescan-wait ioctl and close_ctree at unmount);
+    # the copy inlined into btrfs_quota_disable stays internal.
+    "WaitRescanCompletion_Enter", "WaitRescanCompletion_Done",
     "FreeQgroupConfig_Enter", "FreeQgroupConfig_Done",
     "RescanWorker_Enter", "RescanWorker_Done",
 }
 WORKER_ACTIONS = {"RescanWorker_Enter", "RescanWorker_Done"}
+QUOTA_OPS = {"QuotaEnable_Enter", "QuotaDisable_Enter", "QgroupRescan_Enter"}
 
 
 def main():
@@ -42,6 +48,9 @@ def main():
                                                   / "models/trace-validated"))
     ap.add_argument("--max-events", type=int, default=0,
                     help="truncate to the first N observable events (0 = all)")
+    ap.add_argument("--fs", default=None,
+                    help="validate this fs_info value (default: the group "
+                         "with quota activity and the most events)")
     args = ap.parse_args()
 
     events = []
@@ -57,6 +66,26 @@ def main():
             continue
         if e.get("action") in OBSERVABLE:
             events.append(e)
+
+    # Split by filesystem: each fs_info is an independent state machine.
+    groups = {}
+    for e in events:
+        groups.setdefault(str(e.get("fs", "?")), []).append(e)
+    if len(groups) > 1 or (args.fs and args.fs in groups):
+        for fs, evs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            active = any(e["action"] in QUOTA_OPS for e in evs)
+            print(f"fs {fs}: {len(evs)} events"
+                  + (" (quota-active)" if active else ""))
+        if args.fs:
+            if args.fs not in groups:
+                sys.exit(f"--fs {args.fs} not in trace")
+            events = groups[args.fs]
+        else:
+            active = [g for g in groups.values()
+                      if any(e["action"] in QUOTA_OPS for e in g)]
+            events = max(active or groups.values(), key=len)
+        print(f"validating fs {events[0].get('fs', '?')} "
+              f"({len(events)} of {sum(len(g) for g in groups.values())} events)")
 
     events.sort(key=lambda e: e.get("ts", 0))
     if args.max_events:
