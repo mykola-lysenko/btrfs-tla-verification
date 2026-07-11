@@ -17,6 +17,7 @@ kernel is then checked by replaying an actual bpftrace trace against it.
 |---|---|
 | `BtrfsQgroupLifecycle.tla` | The model: enable / disable / rescan / worker state machine, extracted from `fs/btrfs/qgroup.c` + `ioctl.c` (7.1-rc7). Actions named to match the bpftrace events. |
 | `BtrfsQgroupLifecycle_{buggy,fixed}.cfg` | The same model with `FixFreeHoldsQgroupLock` FALSE/TRUE — the one line the CVE-2025-39759 fix changed. |
+| `BtrfsQgroupLifecycle_workerrace.cfg` | Reachability witness: the rescan worker is a second UAF victim (see below). |
 | `BtrfsQgroupTrace.tla` + `validate-trace.sh` | Trace validation: replays a real kernel trace and checks it is an accepted behavior of the model. |
 
 ## Part 1 — model checking (does the bug emerge?)
@@ -44,7 +45,28 @@ u2: btrfs_qgroup_rescan ... qgroup_rescan_zero_tracking is iterating the
 ```
 
 With `FixFreeHoldsQgroupLock = TRUE` the free loop takes `qgroup_lock`, which
-excludes it against the iterator, and NoUAF holds across all 44k states.
+excludes it against the iterator, and NoUAF holds across all 74k states.
+
+### The worker is a second victim (`_workerrace.cfg`)
+
+Modeling the rescan worker's own tree walk — `qgroup_rescan_leaf` takes
+`qgroup_lock` and calls `find_qgroup_rb` on the same rb-tree the free loop
+erases (`W_ScanLock`/`W_ScanUnlock`) — exposed a **second** use-after-free
+victim, distinct from the rescan ioctl's `zero_tracking`:
+
+```bash
+run BtrfsQgroupLifecycle_workerrace.cfg   # => NoWorkerRaceWithFree violated (pre-fix)
+```
+
+Mechanism (from the counterexample): disable clears `QUOTA_ENABLED` and
+passes `wait_for_completion` *in the CVE hole* — a concurrent rescan has set
+`FLAG_RESCAN` but not yet `rescan_running`. The rescan then reaches
+`R_Queue` and starts the worker, which begins scanning under `qgroup_lock`
+while disable is still in its unlocked free loop → the free collides with
+the **worker's** iterator, not the ioctl's. Same root cause (the early
+`wait_for_completion` return), second blast site. Flip the constant to
+`TRUE` and it holds: the fix guards the *tree*, so one lock covers both
+victims — which is exactly why the real one-line fix is sufficient.
 
 ## Part 2 — trace validation (is the model faithful?)
 

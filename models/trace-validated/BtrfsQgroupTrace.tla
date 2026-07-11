@@ -58,18 +58,20 @@ InternalOf(t) ==
          \* so an idle task cannot wander into these paths spuriously
          \/ U_WaitRead(t) \/ U_WaitBlocked(t)
          \/ M_WaitRead(t) \/ M_WaitBlocked(t) \/ M_FreeLock(t) \/ M_FreeDo(t))
-    \/ (t = Worker) /\ (W_ExitLoop \/ W_Finish)
+    \/ (t = Worker) /\ (W_ScanLock \/ W_ScanUnlock \/ W_ExitLoop \/ W_Finish)
 
 \* Anticipatory cross-task steps — handoffs whose effect precedes the
 \* handing task's next observable event. Two exist in this protocol:
 \*   Enqueue: E_Queue/R_Queue set workerQueued, enabling RescanWorker_Enter
 \*     before the queueing ioctl returns (its Done event comes later).
-\*   WorkerFinish: W_ExitLoop/W_Finish run complete_all INSIDE the worker,
-\*     unblocking a waiter's WaitRescanCompletion_Done before the worker's
-\*     own RescanWorker_Done (the kretprobe at function exit) appears.
+\*   WorkerFinish: the worker's scan and completion steps run between its
+\*     RescanWorker_Enter and _Done. Its scan grabs/releases qgroup_lock
+\*     (W_ScanLock/Unlock, unobserved), and W_Finish's complete_all can
+\*     unblock a waiter's WaitRescanCompletion_Done before the worker's own
+\*     RescanWorker_Done (kretprobe at function exit) appears.
 \* Any OTHER hidden cross-task dependency would deadlock TLC.
 Enqueue      == \E t \in UserTasks : E_Queue(t) \/ R_Queue(t)
-WorkerFinish == W_ExitLoop \/ W_Finish
+WorkerFinish == W_ScanLock \/ W_ScanUnlock \/ W_ExitLoop \/ W_Finish
 
 TNext ==
     \/ /\ idx <= Len(Trace)

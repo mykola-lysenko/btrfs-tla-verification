@@ -105,7 +105,7 @@ UserPCs == {"idle",
             \* close_ctree (unmount): wait, free config, teardown
             "m_wait_read", "m_wait_block", "m_wait_done",
             "m_free_enter", "m_free_lock", "m_free_do", "m_free_done"}
-WorkerPCs == {"w_idle", "w_run", "w_finish", "w_exit"}
+WorkerPCs == {"w_idle", "w_run", "w_scan", "w_finish", "w_exit"}
 
 \* A task inside the unmount path = BTRFS_FS_CLOSING is set (close_ctree
 \* sets it before the qgroup teardown steps modeled here).
@@ -583,6 +583,30 @@ WorkerStart ==              \* observable: RescanWorker_Enter
                    completionDone, workerStopped, qgroupLock, rescanLock,
                    subvolSem, iterating, uafOccurred>>
 
+W_ScanLock ==               \* internal: qgroup_rescan_leaf takes qgroup_lock
+                            \* and walks the qgroup rb-tree (find_qgroup_rb,
+                            \* qgroup_iterator_*) — the SAME tree the free
+                            \* loop erases. The worker is thus an iterator,
+                            \* and the CVE fix protects it here too. Modeled
+                            \* as one representative locked leaf iteration.
+    /\ pc[Worker] = "w_run" /\ qgroupLock = NoTask /\ Worker \notin iterating
+    /\ qgroupLock' = Worker
+    /\ iterating' = iterating \cup {Worker}
+    /\ pc' = [pc EXCEPT ![Worker] = "w_scan"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, rescanLock,
+                   subvolSem, uafOccurred>>
+
+W_ScanUnlock ==             \* internal: leaf done; spin_unlock. Loops back to
+                            \* w_run (the worker scans many leaves) or exits.
+    /\ pc[Worker] = "w_scan" /\ qgroupLock = Worker /\ Worker \in iterating
+    /\ qgroupLock' = NoTask
+    /\ iterating' = iterating \ {Worker}
+    /\ pc' = [pc EXCEPT ![Worker] = "w_run"]
+    /\ UNCHANGED <<quotaRoot, quotaEnabled, flagOn, flagRescan, rescanRunning,
+                   completionDone, workerQueued, workerStopped, rescanLock,
+                   subvolSem, uafOccurred>>
+
 W_ExitLoop ==               \* internal: scan loop exits; `stopped` is
                             \* rescan_should_stop() = !quotaEnabled or the
                             \* fs is closing (unmount in progress)
@@ -641,7 +665,7 @@ Internal ==
         \/ R_Init(t) \/ R_Commit(t) \/ R_ZTLock(t) \/ R_ZTUnlock(t) \/ R_Queue(t)
         \/ U_WaitRead(t) \/ U_WaitBlocked(t)
         \/ M_WaitRead(t) \/ M_WaitBlocked(t) \/ M_FreeLock(t) \/ M_FreeDo(t)
-    \/ W_ExitLoop \/ W_Finish
+    \/ W_ScanLock \/ W_ScanUnlock \/ W_ExitLoop \/ W_Finish
 
 ObservableNames == {"QuotaEnable_Enter", "QuotaEnable_Done",
                     "QuotaDisable_Enter", "QuotaDisable_Done",
@@ -663,5 +687,22 @@ Spec == Init /\ [][Next]_vars
 (* the modeled lock discipline makes reachable iff the fix is absent.      *)
 (***************************************************************************)
 NoUAF == ~uafOccurred
+
+(***************************************************************************)
+(* Reachability witness (checked by _workerrace.cfg): can the free loop    *)
+(* run while the RESCAN WORKER holds a live tree iterator? Modeling the    *)
+(* worker's qgroup_rescan_leaf tree walk (W_ScanLock/Unlock) exposed the   *)
+(* worker as a SECOND victim of CVE-2025-39759, distinct from the rescan   *)
+(* ioctl's own zero_tracking. Mechanism: disable clears QUOTA_ENABLED and  *)
+(* passes wait_for_completion in the hole (a concurrent rescan has set     *)
+(* FLAG_RESCAN but not yet rescan_running); the rescan then queues the     *)
+(* worker, which starts scanning under qgroup_lock while disable is still  *)
+(* in the (unlocked, pre-fix) free loop. Violated with the fix absent;     *)
+(* holds with FixFreeHoldsQgroupLock = TRUE — the fix guards the tree      *)
+(* itself, so it covers both victims.                                      *)
+(***************************************************************************)
+NoWorkerRaceWithFree ==
+    ~(Worker \in iterating /\
+      \E t \in UserTasks : pc[t] \in {"d_free_do", "m_free_do"})
 
 ================================================================================
